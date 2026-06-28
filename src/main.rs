@@ -64,7 +64,14 @@ enum Cmd {
         /// Your peer's persona name (e.g. Peter), used when creating the roster.
         #[arg(long = "with")]
         with: Option<String>,
-        /// Collaboration name. Default: the single registered one, else "default".
+        /// The project/goal from your prompt (e.g. "fix the checkout flow"). spriff
+        /// derives a STABLE board slug from it, so a peer who passes the same
+        /// --project lands on the same board with zero coordination, and the text
+        /// becomes the collaboration's mission. Beats relying on "default".
+        #[arg(long)]
+        project: Option<String>,
+        /// Collaboration name (overrides --project's derived slug). Default: the
+        /// single registered one; errors if ambiguous; else "default".
         #[arg(long)]
         collab: Option<String>,
         /// Repo to mark (defaults to the current directory).
@@ -284,10 +291,11 @@ fn main() -> Result<()> {
             role,
             as_name,
             with,
+            project,
             collab,
             repo,
             agents,
-        } => cmd_join(&role, as_name, with, collab, repo, agents),
+        } => cmd_join(&role, as_name, with, project, collab, repo, agents),
         Cmd::Whoami {
             collab,
             config,
@@ -722,13 +730,57 @@ fn resolve_persona(explicit: Option<String>, cfg: &Config) -> String {
     resolve_persona_with_source(explicit, cfg).0
 }
 
+/// Derive a STABLE board slug from free-text project/goal: lowercase, runs of
+/// non-alphanumerics collapse to a single '-', trimmed, capped. The same project
+/// text always yields the same slug, so two agents who pass the same --project
+/// land on the same board with no other coordination.
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !out.is_empty() && !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    let slug: String = out.trim_matches('-').chars().take(48).collect();
+    let slug = slug.trim_end_matches('-').to_string();
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
+}
+
+/// The board to join when the agent gave no explicit signal: the single
+/// registered collaboration, or "default" if none — but if SEVERAL exist, refuse
+/// to guess (which would silently join the wrong board) and ask for disambiguation.
+fn resolve_join_default() -> Result<String> {
+    let l = registry::list();
+    match l.len() {
+        0 => Ok("default".to_string()),
+        1 => Ok(l[0].clone()),
+        _ => anyhow::bail!(
+            "several collaborations exist ({}) and you gave no project. Pass \
+             --project \"<your goal>\" (recommended — your peer passes the same and you meet) \
+             or --collab <name>.",
+            l.join(", ")
+        ),
+    }
+}
+
 /// Onboard an agent: auto-create/join the collaboration, claim the role's
 /// persona, write a repo marker so later commands need no flags, and print the
 /// protocol + first move. The single command an agent runs to start.
+#[allow(clippy::too_many_arguments)]
 fn cmd_join(
     role: &str,
     as_name: Option<String>,
     with: Option<String>,
+    project: Option<String>,
     collab: Option<String>,
     repo: Option<PathBuf>,
     agents: usize,
@@ -743,21 +795,29 @@ fn cmd_join(
         anyhow::bail!("unknown role '{role}'. Use --role implementer or --role reviewer.");
     }
 
-    // Resolve which collaboration to join: explicit → marker/env → the single
-    // registered one → "default" (created on demand). So two agents told only
-    // their role land on the same board with zero coordination.
-    let name = collab
-        .or_else(|| {
-            std::env::var("SPRIFF_COLLAB")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| registry::marker_field("collab"))
-        .or_else(|| {
-            let l = registry::list();
-            (l.len() == 1).then(|| l[0].clone())
-        })
-        .unwrap_or_else(|| "default".to_string());
+    // Resolve which board to join, in priority order:
+    //   1. explicit --collab
+    //   2. --project text -> a STABLE slug (so two agents who pass the same project
+    //      from their prompts deterministically meet on the same board)
+    //   3. $SPRIFF_COLLAB / `.spriff` marker (an already-established context)
+    //   4. the single registered collaboration
+    //   5. "default" ONLY when nothing is registered; if several exist and the
+    //      agent gave no signal, STOP and ask for --project/--collab rather than
+    //      silently joining the wrong board.
+    let name = if let Some(c) = collab {
+        c
+    } else if let Some(p) = &project {
+        slugify(p)
+    } else if let Some(c) = std::env::var("SPRIFF_COLLAB")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        c
+    } else if let Some(c) = registry::marker_field("collab") {
+        c
+    } else {
+        resolve_join_default()?
+    };
 
     // Roster slots are FIXED: executor=0, reviewer=1. Only the *source* of each
     // name varies by role — `--as` names MY slot, `--with` names my peer's.
@@ -769,7 +829,8 @@ fn cmd_join(
     };
 
     // Create it if it doesn't exist yet (first agent to join wins; idempotent).
-    if !registry::config_path(&name).exists() {
+    let created = !registry::config_path(&name).exists();
+    if created {
         let mut roster = build_roster(agents.max(2), None, &[]);
         if let Some(n) = &as_name {
             roster[my_slot] = n.clone();
@@ -778,6 +839,13 @@ fn cmd_join(
             roster[peer_slot] = n.clone();
         }
         create_collab(&name, &roster, None)?;
+        // Seed the mission from --project so the goal is on the board for both
+        // agents (and injected into any `serve` prompts). An existing collab keeps
+        // its mission — we don't overwrite a peer's.
+        if let Some(p) = &project {
+            let cfg0 = Config::load(&registry::config_path(&name))?;
+            std::fs::write(mission_path(&cfg0.board_path()), format!("{}\n", p)).ok();
+        }
     }
     let cfg = Config::load(&registry::config_path(&name))?;
 
@@ -820,8 +888,21 @@ fn cmd_join(
 
     let role_label = if is_impl { "implementer" } else { "reviewer" };
     let peers = cfg.peers(&persona).join(", ");
+    let other_role = if is_impl { "reviewer" } else { "implementer" };
     println!("════════════════════════════════════════════════════════════════");
     println!("  You are {persona} — the {role_label} on collaboration '{name}'.");
+    if let Some(p) = &project {
+        println!(
+            "  Project: \"{p}\"  ({} board slug '{name}')",
+            if created {
+                "created"
+            } else {
+                "joined existing"
+            }
+        );
+        println!("  → Your peer joins the SAME board with:");
+        println!("      spriff join --role {other_role} --project \"{p}\"");
+    }
     println!(
         "  Your peer(s): {}",
         if peers.is_empty() {
@@ -1505,6 +1586,23 @@ mod tests {
         assert!(acquire_serve_lock(&board, "Alice").is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn slugify_is_stable_and_clean() {
+        assert_eq!(
+            slugify("spriff doctor health-check"),
+            "spriff-doctor-health-check"
+        );
+        assert_eq!(
+            slugify("  Fix the Checkout Flow!! "),
+            "fix-the-checkout-flow"
+        );
+        assert_eq!(slugify("a/b\\c"), "a-b-c");
+        // The whole point: the same text always yields the same slug.
+        assert_eq!(slugify("My Project"), slugify("my   project"));
+        // Never empty.
+        assert_eq!(slugify("***"), "project");
     }
 
     #[test]
