@@ -1075,9 +1075,13 @@ fn cmd_join(
             "You are the REVIEWER. This loop IS your whole job — repeat it until the work is DONE:"
         );
         println!("  1. spriff wait --as {me}      ← BLOCKS cheaply until the implementer posts");
-        println!("  2. Actually review it: read the diff/files, run the tests + linters.");
+        println!("  2. Try to BREAK it: read the diff against the goal, run the tests + linters,");
+        println!("     hunt the failing case. Skeptical by default — don't bless it.");
         println!("  3. spriff post --as {me} -s \"review: <area>\" --status <NEEDS-REVIEW|BLOCKED|DONE> <<'EOF'");
-        println!("       <specific findings: file:line + the issue — or LGTM with reasoning>");
+        println!(
+            "       <a specific defect: file:line + the failing case — never a bare \"LGTM\";"
+        );
+        println!("        if you truly found none, say what you tried to break and why it holds>");
         println!("     EOF");
         println!("  4. spriff ack --as {me}");
         println!("  5. GO BACK TO STEP 1. Never stop after one review; reject a premature DONE.");
@@ -1465,9 +1469,13 @@ fn completion_clause(mission: Option<&str>) -> String {
     };
     format!(
         " This is a DRIVE-TO-COMPLETION collaboration: do NOT declare the work DONE (--status \
-         DONE) until it is {DEFINITION_OF_DONE}. As reviewer, REJECT a premature DONE and name \
-         the precise gap; as implementer, keep closing gaps. Keep the implement<->review loop \
-         going until every part is genuinely shipped.{m}"
+         DONE) until it is {DEFINITION_OF_DONE}. As reviewer, be the fresh, skeptical, \
+         different-model eyes: actively try to BREAK the work and either name a specific defect \
+         (file:line / the failing case) or say what you checked and why it holds — never a bare \
+         'LGTM'; judge the artifact against the goal, not the author's explanation; advise, don't \
+         rubber-stamp; and REJECT a premature DONE, naming the precise gap. As implementer, you \
+         own the artifact — keep closing gaps. Keep the implement<->review loop going until every \
+         part is genuinely shipped.{m}"
     )
 }
 
@@ -1685,6 +1693,27 @@ mod tests {
         let without = completion_clause(None);
         assert!(without.contains("DRIVE-TO-COMPLETION"));
         assert!(!without.contains("MISSION:"));
+    }
+
+    #[test]
+    fn completion_clause_carries_the_skeptical_review_contract() {
+        // The research-backed review discipline must reach even headless `serve`
+        // agents via the supervisor prompt: try to break it, no bare rubber-stamp,
+        // judge the artifact not the author's story, advise rather than average.
+        let c = completion_clause(None);
+        assert!(
+            c.contains("try to BREAK"),
+            "must tell the reviewer to break it"
+        );
+        assert!(c.contains("LGTM"), "must forbid a bare LGTM");
+        assert!(
+            c.contains("not the author") || c.contains("artifact against the goal"),
+            "must frame review as artifact-vs-goal, not the author's explanation"
+        );
+        assert!(
+            c.contains("own the artifact"),
+            "must keep ownership asymmetric"
+        );
     }
 
     #[test]
