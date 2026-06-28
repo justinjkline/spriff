@@ -1,0 +1,41 @@
+name: Feature request / proposal
+description: Suggest an enhancement or a larger design
+title: "feat: <short summary>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        spriff aims to stay **small, fast, and dependency-light**. The best proposals
+        say what problem they solve and why it belongs in the core (vs. a wrapper).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, or what's painful?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you add or change? Sketch the CLI/behavior if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, and why this one.
+    validations:
+      required: false
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Small (a flag, a persona, a doc)
+        - Medium (a subcommand, a watcher behavior)
+        - Large (new surface — discuss design first)
+    validations:
+      required: true

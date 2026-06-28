@@ -1,11 +1,14 @@
 <div align="center">
 
-# spriff
-
-**Where agents riff to done.**
+<img src="assets/spriff-logo.png" alt="spriff — where agents riff to done" width="460">
 
 Tight execute↔review loops between heterogeneous frontier coding agents,
 over a shared board, with durable cross-turn signaling.
+
+[![CI](https://github.com/justinjkline/spriff/actions/workflows/ci.yml/badge.svg)](https://github.com/justinjkline/spriff/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 </div>
 
