@@ -1140,17 +1140,49 @@ fn cmd_join(
         let created = !registry::config_path(&name).exists();
         if created {
             let mut roster = build_roster(agents.max(2), None, &[]);
-            // Resolve MY slot against the GENERATED roster, not the hardcoded
-            // default — otherwise a reviewer that CREATES the board (reviewer #2
-            // winning the create race) writes its name over slot 1, duplicating
-            // itself and dropping the first reviewer (`Abbey, Annie, Annie`).
-            // (Alice's catch: the slot fix must participate in creation too.)
+            // Apply --with FIRST: it can rename the peer/executor slot, and the
+            // role-conflict check below must see the post-with executor name.
+            if let Some(n) = &with {
+                roster[peer_slot] = n.clone();
+            }
+            // A reviewer whose --as names the executor slot (slot 0) is a ROLE
+            // CONFLICT — a reviewer can't be the implementer. Without this, --as
+            // matching slot 0 fell back to slot 1 and then OVERWROTE the first
+            // reviewer with the executor's name (`Abbey, Abbey, Annie`), and
+            // validation passed because slot 1 was now also that name. (Alice.)
+            if is_review {
+                if let Some(n) = &as_name {
+                    if roster
+                        .first()
+                        .map(|e| e.eq_ignore_ascii_case(n))
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "--as {n} is the implementer on a new '{name}' crew but --role is \
+                             reviewer — a reviewer can't claim the implementer's slot. Use a \
+                             reviewer name, or pass --with <implementer> to name the implementer."
+                        );
+                    }
+                }
+            }
+            // Resolve MY slot against the GENERATED roster so a reviewer that
+            // CREATES the board (reviewer #2 winning the create race) lands in its
+            // own slot instead of clobbering the first reviewer. (Alice's catch.)
             let create_slot = resolve_my_slot(is_review, as_name.as_deref(), my_slot, &roster);
             if let Some(n) = &as_name {
                 roster[create_slot] = n.clone();
             }
-            if let Some(n) = &with {
-                roster[peer_slot] = n.clone();
+            // Final roster personas MUST be distinct — a duplicate makes identity
+            // ambiguous and silently passes --as validation. (Alice's catch.)
+            let mut seen = std::collections::HashSet::new();
+            for p in &roster {
+                if !seen.insert(p.to_lowercase()) {
+                    anyhow::bail!(
+                        "creating '{name}' would put two agents named '{p}' on the roster ({}). \
+                         Personas must be distinct — check --as/--with.",
+                        roster.join(", ")
+                    );
+                }
             }
             create_collab(&name, &roster, None)?;
         }

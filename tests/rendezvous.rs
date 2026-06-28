@@ -581,3 +581,82 @@ fn second_reviewer_can_create_the_crew_first() {
     // Annie's lens still landed.
     assert!(stdout(&sb.run(&c, &["status", "--as", "Annie"])).contains("correctness"));
 }
+
+// ---------------------------------------------------------------------------
+// 10. A reviewer naming the GENERATED EXECUTOR (no --with) is a role conflict —
+//     rejected, with NO corrupt board created. (Alice's catch: it used to fall
+//     back to slot 1 and overwrite the first reviewer → Abbey, Abbey, Annie.)
+// ---------------------------------------------------------------------------
+#[test]
+fn reviewer_naming_the_generated_executor_is_rejected() {
+    let sb = Sandbox::new("execconflict");
+    let a = sb.cwd("rev");
+    let o = sb.run(
+        &a,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Abbey",
+            "--project",
+            "bad exec",
+            "--agents",
+            "3",
+            "--lens",
+            "security",
+        ],
+    );
+    assert!(!o.status.success(), "reviewer-as-executor must be rejected");
+    assert!(
+        stderr(&o).contains("implementer"),
+        "error should explain the role conflict:\n{}",
+        stderr(&o)
+    );
+    assert!(
+        sb.slugs().is_empty(),
+        "a rejected join must not create a board: {:?}",
+        sb.slugs()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. A reviewer MAY rename the implementer via --with (Alice's note that this
+//     variant is legitimate): `--as Abbey --with Alice` → Alice executor, Abbey
+//     reviewer, no duplicates.
+// ---------------------------------------------------------------------------
+#[test]
+fn reviewer_may_rename_the_implementer_via_with() {
+    let sb = Sandbox::new("withrename");
+    let a = sb.cwd("rev");
+    let o = sb.run(
+        &a,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Abbey",
+            "--with",
+            "Alice",
+            "--project",
+            "with rename",
+            "--agents",
+            "3",
+            "--lens",
+            "security",
+        ],
+    );
+    assert!(
+        o.status.success(),
+        "valid --with rename failed: {}",
+        stderr(&o)
+    );
+    assert!(marker(&a).contains("as=Abbey"), "marker: {}", marker(&a));
+    let cfg = std::fs::read_to_string(sb.root.join("with-rename").join("with-rename.toml"))
+        .expect("config written");
+    // One each — no duplicate from the rename.
+    assert_eq!(cfg.matches("persona = \"Alice\"").count(), 1, "{cfg}");
+    assert_eq!(cfg.matches("persona = \"Abbey\"").count(), 1, "{cfg}");
+    assert_eq!(cfg.matches("persona = \"Annie\"").count(), 1, "{cfg}");
+}
