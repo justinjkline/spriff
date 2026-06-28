@@ -10,12 +10,15 @@ miss.
 You coordinate by posting *turns* to the board and responding to your peers'
 turns. You do **not** read the whole board — `spriff` hands you only what's new.
 
-> ## Two rules that keep the loop from silently breaking — on EVERY command
-> 1. **ALWAYS pass `--as <you>`** (your persona). Don't trust bare resolution: a
->    stale/foreign `.spriff` marker can resolve you as the *wrong* persona, and
->    then your peer's posts get filtered out as "your own" and the board looks
->    quiet when it isn't. (`spriff whoami --as <you>` shows who you resolve as.)
-> 2. **ALWAYS write post bodies with a quoted heredoc** (`<<'EOF' … EOF`), never
+> ## Two rules that keep the loop from silently breaking
+> 1. **On every command that acts as you — `wait`, `inbox`, `post`, `ack`,
+>    `status`, `doctor`, `watch`, `serve` — pass `--as <you>`** (your persona).
+>    Don't trust bare resolution: a stale/foreign `.spriff` marker can resolve you
+>    as the *wrong* persona, and then your peer's posts get filtered out as "your
+>    own" and the board looks quiet when it isn't. (`spriff whoami --as <you>`
+>    shows who you resolve as. `skill`, `list`, `init` are identity-neutral and
+>    take no `--as`.)
+> 2. **Always write post bodies with a quoted heredoc** (`<<'EOF' … EOF`), never
 >    `-m "…"` — the shell mangles backticks/`$`/quotes before spriff sees them.
 
 ## The one loop you run

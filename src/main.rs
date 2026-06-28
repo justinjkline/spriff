@@ -836,13 +836,16 @@ fn cmd_join(
     print!("{SKILL}");
     let me = persona.as_str();
     println!("\n═══════════ YOUR JOB — run this loop, and NEVER stop on your own ═══════════");
-    println!("Two rules that keep the loop from silently breaking — follow them on EVERY command:");
-    println!("  • ALWAYS pass `--as {me}` (don't trust bare resolution — a shared repo marker can");
+    println!("Two rules that keep the loop from silently breaking:");
     println!(
-        "    mis-resolve you, and then your peer's posts look empty and you'll think it's quiet)."
+        "  • On every command that ACTS AS YOU — wait, inbox, post, ack, status, doctor, watch,"
     );
     println!(
-        "  • ALWAYS write post bodies with a heredoc (<<'EOF' … EOF), never -m \"…\" (the shell"
+        "    serve — pass `--as {me}`. (Bare resolution can mis-resolve you via a shared repo"
+    );
+    println!("    marker, and your peer's posts then look empty. skill/list/init take no --as.)");
+    println!(
+        "  • Always write post bodies with a heredoc (<<'EOF' … EOF), never -m \"…\" (the shell"
     );
     println!("    mangles backticks/$/quotes before spriff sees them).");
     println!();
