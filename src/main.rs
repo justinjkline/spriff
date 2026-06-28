@@ -74,6 +74,11 @@ enum Cmd {
         /// single registered one; errors if ambiguous; else "default".
         #[arg(long)]
         collab: Option<String>,
+        /// Your model class (e.g. claude, gpt, gemini, glm). Recorded so `doctor`
+        /// can flag a same-class implementer/reviewer pairing — which forfeits most
+        /// of the error-decorrelation gain that makes a heterogeneous crew win.
+        #[arg(long)]
+        class: Option<String>,
         /// Repo to mark (defaults to the current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -293,9 +298,10 @@ fn main() -> Result<()> {
             with,
             project,
             collab,
+            class,
             repo,
             agents,
-        } => cmd_join(&role, as_name, with, project, collab, repo, agents),
+        } => cmd_join(&role, as_name, with, project, collab, class, repo, agents),
         Cmd::Whoami {
             collab,
             config,
@@ -520,6 +526,56 @@ fn read_mission(board: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(mission_path(board)).ok()?;
     let t = text.trim();
     (!t.is_empty()).then(|| t.to_string())
+}
+
+/// The per-persona model-class sidecar: `<base>.<persona>.class`. Written by
+/// `join --class` so an agent can declare its model class without rewriting the
+/// shared config TOML (same sidecar pattern as the cursor/flag files).
+fn class_path(board: &std::path::Path, persona: &str) -> PathBuf {
+    let state = Sidecars::derive(board, persona).state; // <base>.<persona>.watch.state
+    let s = state.to_string_lossy();
+    PathBuf::from(format!("{}class", s.trim_end_matches("watch.state")))
+}
+
+/// An agent's declared model class: the live `join --class` sidecar if present,
+/// else the seed `class` field in the config roster, else None.
+fn resolve_class(cfg: &Config, board: &std::path::Path, persona: &str) -> Option<String> {
+    if let Ok(t) = std::fs::read_to_string(class_path(board, persona)) {
+        let t = t.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    cfg.agents
+        .iter()
+        .find(|a| a.persona.eq_ignore_ascii_case(persona))
+        .and_then(|a| a.class.clone())
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+}
+
+/// Warn when two agents share a model class. PURE + testable. A same-class
+/// implementer/reviewer pair forfeits most of the error-decorrelation gain that
+/// makes a heterogeneous crew beat a single model — the reviewer's mistakes are
+/// correlated with the implementer's, so it catches less. Returns the FIRST
+/// colliding pair in roster order (deterministic). `roster` is (persona, class).
+fn heterogeneity_advisory(roster: &[(String, Option<String>)]) -> Option<String> {
+    for i in 0..roster.len() {
+        for j in (i + 1)..roster.len() {
+            if let (Some(ca), Some(cb)) = (&roster[i].1, &roster[j].1) {
+                let (na, nb) = (ca.trim().to_lowercase(), cb.trim().to_lowercase());
+                if !na.is_empty() && na == nb {
+                    return Some(format!(
+                        "{} and {} share model class '{na}': a same-class pair forfeits most of \
+                         the error-decorrelation gain — pair different model classes (e.g. one \
+                         Claude, one GPT) so the reviewer fails differently than the implementer",
+                        roster[i].0, roster[j].0
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Do a stored mission and supplied `--project` text name the SAME goal?
@@ -878,6 +934,7 @@ fn cmd_join(
     with: Option<String>,
     project: Option<String>,
     collab: Option<String>,
+    class: Option<String>,
     repo: Option<PathBuf>,
     agents: usize,
 ) -> Result<()> {
@@ -1001,6 +1058,18 @@ fn cmd_join(
     let marker = repo.join(".spriff");
     std::fs::write(&marker, format!("collab={name}\nas={persona}\n"))
         .with_context(|| format!("writing marker {}", marker.display()))?;
+
+    // Record this agent's declared model class (sidecar, so no config rewrite) so
+    // `doctor` can flag a same-class implementer/reviewer pairing — heterogeneity
+    // is the whole point, and a same-class pair forfeits most of the gain.
+    if let Some(c) = &class {
+        let c = c.trim();
+        if !c.is_empty() {
+            let p = class_path(&cfg.board_path(), &persona);
+            std::fs::write(&p, format!("{c}\n"))
+                .with_context(|| format!("writing class sidecar {}", p.display()))?;
+        }
+    }
 
     let role_label = if is_impl { "implementer" } else { "reviewer" };
     let peers = cfg.peers(&persona).join(", ");
@@ -1516,6 +1585,9 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
         Some(role) => println!("  persona:    {persona} ({role})"),
         None => println!("  persona:    {persona}"),
     }
+    if let Some(c) = resolve_class(cfg, &board_path, persona) {
+        println!("  class:      {c}");
+    }
     println!("  board:      {} ({} bytes)", board_path.display(), size);
     println!("  cursor:     offset={}", st.offset);
     match last {
@@ -1635,6 +1707,7 @@ fn cmd_doctor(
                 );
             }
             println!("  agents:");
+            let mut roster_classes: Vec<(String, Option<String>)> = Vec::new();
             for a in &cfg.agents {
                 let sc = Sidecars::derive(&board, &a.persona);
                 let st = state::WatchState::load(&sc.state);
@@ -1647,9 +1720,24 @@ fn cmd_doctor(
                     ""
                 };
                 let role = a.role.clone().unwrap_or_default();
+                let class = resolve_class(&cfg, &board, &a.persona);
+                let class_str = class
+                    .as_deref()
+                    .map(|c| format!(" · class={c}"))
+                    .unwrap_or_default();
                 println!(
-                    "    {} ({role}): {unread} unread · cursor={}{serving}",
+                    "    {} ({role}): {unread} unread · cursor={}{serving}{class_str}",
                     a.persona, st.offset
+                );
+                roster_classes.push((a.persona.clone(), class));
+            }
+            // Heterogeneity: warn on a same-class pair; nudge if none declared.
+            if let Some(adv) = heterogeneity_advisory(&roster_classes) {
+                warnings.push(adv);
+            } else if roster_classes.iter().all(|(_, c)| c.is_none()) {
+                println!(
+                    "  heterogeneity: model classes not declared — `spriff join --role <r> \
+                     --class <claude|gpt|…>` lets spriff flag a same-class pairing"
                 );
             }
         }
@@ -1682,6 +1770,37 @@ mod tests {
             mission_path(Path::new("/x/bar.md")),
             PathBuf::from("/x/bar.mission.md")
         );
+    }
+
+    #[test]
+    fn class_path_derivation() {
+        // Sidecars lowercase the persona, so write (join --class) and read
+        // (doctor/status) resolve to the same file regardless of name casing.
+        assert_eq!(
+            class_path(Path::new("/x/foo.board.md"), "Abbey"),
+            PathBuf::from("/x/foo.abbey.class")
+        );
+    }
+
+    #[test]
+    fn heterogeneity_advisory_flags_same_class_pairs() {
+        let pair = |a: &str, ca: Option<&str>, b: &str, cb: Option<&str>| {
+            vec![
+                (a.to_string(), ca.map(str::to_string)),
+                (b.to_string(), cb.map(str::to_string)),
+            ]
+        };
+        // Different classes -> healthy, no advisory.
+        assert!(
+            heterogeneity_advisory(&pair("Abbey", Some("claude"), "Alice", Some("gpt"))).is_none()
+        );
+        // Same class (case/space-insensitive) -> warn, naming both + the class.
+        let w = heterogeneity_advisory(&pair("Abbey", Some("Claude"), "Alice", Some(" claude ")))
+            .expect("same-class pair must warn");
+        assert!(w.contains("Abbey") && w.contains("Alice") && w.contains("claude"));
+        // Unknown classes (either unset) -> can't conclude, so no false alarm.
+        assert!(heterogeneity_advisory(&pair("Abbey", None, "Alice", Some("gpt"))).is_none());
+        assert!(heterogeneity_advisory(&pair("Abbey", None, "Alice", None)).is_none());
     }
 
     #[test]
