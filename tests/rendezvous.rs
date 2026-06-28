@@ -51,6 +51,11 @@ impl Sandbox {
         c.env("SPRIFF_HOME", &self.root)
             .env_remove("SPRIFF_COLLAB")
             .env_remove("SPRIFF_AS")
+            // resolve() prefers SPRIFF_CONFIG over the cwd marker for non-join
+            // commands (post/inbox/ack), so a dev's ambient config would hijack
+            // the isolated board. Scrub it too, or the suite isn't hermetic.
+            // (Alice's catch.)
+            .env_remove("SPRIFF_CONFIG")
             .current_dir(cwd)
             .args(args);
         c
@@ -350,6 +355,7 @@ fn concurrent_same_project_joins_converge_on_one_board() {
                 .env("SPRIFF_HOME", &root)
                 .env_remove("SPRIFF_COLLAB")
                 .env_remove("SPRIFF_AS")
+                .env_remove("SPRIFF_CONFIG")
                 .current_dir(&cwd)
                 .args(["join", "--role", role, "--project", "race goal"])
                 .output()
