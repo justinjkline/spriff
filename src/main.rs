@@ -508,41 +508,38 @@ fn cmd_join(
     println!("  (bare `spriff` commands in this repo now act as {persona})");
     println!("════════════════════════════════════════════════════════════════\n");
     print!("{SKILL}");
-    println!("\n──────────────────────────── your first move ────────────────────────────");
-    if is_impl {
-        println!("1. Introduce yourself + declare the files you're touching:");
-        println!("     spriff post -s \"intro\" --status FYI <<'EOF'");
-        println!("     <who you are + your plan>");
-        println!("     EOF");
-        println!(
-            "     spriff touching <path> [<path>...]   # so your reviewer is woken on your edits"
-        );
-        println!("2. Implement a coherent chunk, then hand off for review:");
-        println!("     spriff post -s \"<what you did>\" --status NEEDS-REVIEW <<'EOF'");
-        println!("     <summary + files/lines to scrutinize>");
-        println!("     EOF");
-        println!("3. spriff wait   → review their reply → respond → spriff wait → … until DONE.");
+    println!("\n⟳ GOLDEN RULE: your turn is NOT over until the task is DONE. After every post,");
+    println!("  run `spriff wait` to block for your peer. NEVER go idle — a reply left unread");
+    println!("  stalls the loop; nothing will re-summon you.");
+    println!("✍ Post bodies via heredoc (<<'EOF' … EOF), never -m \"…\" (the shell mangles");
+    println!("  backticks/$/quotes). Re-read the protocol anytime: spriff skill");
+
+    // Live situation — the agent's actual next action, computed now. This is what
+    // makes a one-line human prompt sufficient: spriff itself shows what's waiting
+    // (handle it) or that nothing is (lead / block), whether first-join or resume.
+    println!("\n──────────────────────────────── right now ────────────────────────────────");
+    let delta = current_delta(&cfg, &persona).unwrap_or_default();
+    if !delta.is_empty() {
+        println!("A turn is already waiting for you — handle it now:\n");
+        print_delta(&delta);
+    } else if is_impl {
+        println!("You lead — nothing is waiting. Do this now:");
+        println!("  1. Intro + declare your files:");
+        println!("       spriff post -s \"intro\" --status FYI <<'EOF'");
+        println!("       <who you are + your plan>");
+        println!("       EOF");
+        println!("       spriff touching <path> [<path>...]");
+        println!("  2. Implement a chunk, hand off, then wait:");
+        println!("       spriff post -s \"<what you did>\" --status NEEDS-REVIEW <<'EOF'");
+        println!("       <summary + files/lines to review>");
+        println!("       EOF");
+        println!("       spriff wait      # then review reply → respond → wait → … until DONE");
     } else {
-        println!("1. Introduce yourself:");
-        println!("     spriff post -s \"intro\" --status FYI <<'EOF'");
-        println!("     <who you are + your review bar>");
-        println!("     EOF");
-        println!(
-            "2. Block until the implementer hands off, review the code they reference, reply:"
-        );
-        println!("     spriff wait");
-        println!("     spriff post -s \"review: <area>\" --status NEEDS-REVIEW <<'EOF'");
-        println!("     <file:line + the concrete issue, or LGTM with reasoning>");
-        println!("     EOF");
-        println!("     spriff ack");
-        println!("3. spriff wait again → review next handoff → … until DONE.");
+        println!("Nothing waiting yet. Block until the implementer hands off:");
+        println!("       spriff wait");
+        println!("  then review the code they reference, respond via heredoc, `spriff ack`,");
+        println!("  and `spriff wait` again — loop until DONE.");
     }
-    println!("\n⟳ THE GOLDEN RULE: your turn is NOT over until the task is DONE. After every");
-    println!("  post, run `spriff wait` to block for your peer — never go idle, or the loop");
-    println!("  stalls (your peer's reply will just sit unread in your inbox).");
-    println!("✍ Always pipe post bodies via stdin/heredoc (<<'EOF'), never -m \"…\" — backticks,");
-    println!("  $, and quotes in -m get mangled by the shell.");
-    println!("  Re-read the protocol anytime: spriff skill");
     Ok(())
 }
 
