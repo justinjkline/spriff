@@ -813,37 +813,58 @@ fn cmd_join(
     println!("  (bare `spriff` commands in this repo now act as {persona})");
     println!("════════════════════════════════════════════════════════════════\n");
     print!("{SKILL}");
-    println!("\n⟳ GOLDEN RULE: your turn is NOT over until the task is DONE. After every post,");
-    println!("  run `spriff wait` to block for your peer. NEVER go idle — a reply left unread");
-    println!("  stalls the loop; nothing will re-summon you.");
-    println!("✍ Post bodies via heredoc (<<'EOF' … EOF), never -m \"…\" (the shell mangles");
-    println!("  backticks/$/quotes). Re-read the protocol anytime: spriff skill");
+    let me = persona.as_str();
+    println!("\n═══════════ YOUR JOB — run this loop, and NEVER stop on your own ═══════════");
+    println!("Two rules that keep the loop from silently breaking — follow them on EVERY command:");
+    println!("  • ALWAYS pass `--as {me}` (don't trust bare resolution — a shared repo marker can");
+    println!(
+        "    mis-resolve you, and then your peer's posts look empty and you'll think it's quiet)."
+    );
+    println!(
+        "  • ALWAYS write post bodies with a heredoc (<<'EOF' … EOF), never -m \"…\" (the shell"
+    );
+    println!("    mangles backticks/$/quotes before spriff sees them).");
+    println!();
+    if is_impl {
+        println!("You are the IMPLEMENTER. Loop until the work meets the Definition of Done:");
+        println!("  1. Implement a coherent chunk.");
+        println!("  2. spriff post --as {me} -s \"<what you did>\" --status NEEDS-REVIEW <<'EOF'");
+        println!("       <summary + the files/lines your reviewer should scrutinize>");
+        println!("     EOF");
+        println!("  3. spriff wait --as {me}      ← BLOCKS until your reviewer replies");
+        println!("  4. Read the review, address EVERY point, then GO BACK TO STEP 1.");
+    } else {
+        println!(
+            "You are the REVIEWER. This loop IS your whole job — repeat it until the work is DONE:"
+        );
+        println!("  1. spriff wait --as {me}      ← BLOCKS cheaply until the implementer posts");
+        println!("  2. Actually review it: read the diff/files, run the tests + linters.");
+        println!("  3. spriff post --as {me} -s \"review: <area>\" --status <NEEDS-REVIEW|BLOCKED|DONE> <<'EOF'");
+        println!("       <specific findings: file:line + the issue — or LGTM with reasoning>");
+        println!("     EOF");
+        println!("  4. spriff ack --as {me}");
+        println!("  5. GO BACK TO STEP 1. Never stop after one review; reject a premature DONE.");
+        println!("     You're a different model than the implementer — your job is catching what they can't.");
+    }
+    println!(
+        "\n⚠ Keeping this loop running is YOUR responsibility. If you stop, your peer's posts pile"
+    );
+    println!("  up unread and nothing re-summons you — that's what \"the loop broke\" means. Don't stop.");
+    println!("  Re-read the full protocol anytime: spriff skill");
 
-    // Live situation — the agent's actual next action, computed now. This is what
-    // makes a one-line human prompt sufficient: spriff itself shows what's waiting
-    // (handle it) or that nothing is (lead / block), whether first-join or resume.
+    // Live situation: whatever is already waiting, handle now, then continue looping.
     println!("\n──────────────────────────────── right now ────────────────────────────────");
     let delta = current_delta(&cfg, &persona).unwrap_or_default();
     if !delta.is_empty() {
-        println!("A turn is already waiting for you — handle it now:\n");
+        println!(
+            "{} turn(s) already waiting — handle them now, then continue the loop above:\n",
+            delta.len()
+        );
         print_delta(&delta);
     } else if is_impl {
-        println!("You lead — nothing is waiting. Do this now:");
-        println!("  1. Intro + declare your files:");
-        println!("       spriff post -s \"intro\" --status FYI <<'EOF'");
-        println!("       <who you are + your plan>");
-        println!("       EOF");
-        println!("       spriff touching <path> [<path>...]");
-        println!("  2. Implement a chunk, hand off, then wait:");
-        println!("       spriff post -s \"<what you did>\" --status NEEDS-REVIEW <<'EOF'");
-        println!("       <summary + files/lines to review>");
-        println!("       EOF");
-        println!("       spriff wait      # then review reply → respond → wait → … until DONE");
+        println!("Nothing waiting — you lead. Start at step 1 above (implement → post NEEDS-REVIEW → wait).");
     } else {
-        println!("Nothing waiting yet. Block until the implementer hands off:");
-        println!("       spriff wait");
-        println!("  then review the code they reference, respond via heredoc, `spriff ack`,");
-        println!("  and `spriff wait` again — loop until DONE.");
+        println!("Nothing waiting yet. Start at step 1 above:  spriff wait --as {me}");
     }
     Ok(())
 }
