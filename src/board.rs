@@ -162,6 +162,32 @@ pub fn last_turn_header(path: &Path) -> Option<(String, String, String)> {
         .map(|t| (t.ts.clone(), t.author.clone(), t.subject.clone()))
 }
 
+/// The closed status vocabulary (see docs/BOARD-GRAMMAR.md). Kept here, next to
+/// the grammar, so validation and any future status-aware logic share one source.
+pub const STATUSES: [&str; 6] = [
+    "FYI",
+    "NEEDS-REVIEW",
+    "BLOCKED",
+    "HANDOFF",
+    "DONE",
+    "ACTION-REQUIRED",
+];
+
+/// Normalize and validate a `--status` value against the closed vocabulary.
+/// Returns the canonical upper-case form, or an error listing the valid options —
+/// so a typo like `REVEIW` is rejected loudly instead of silently posted.
+pub fn normalize_status(s: &str) -> Result<String> {
+    let upper = s.trim().to_uppercase();
+    if STATUSES.contains(&upper.as_str()) {
+        Ok(upper)
+    } else {
+        anyhow::bail!(
+            "invalid status '{s}'. Valid statuses: {}.",
+            STATUSES.join(", ")
+        )
+    }
+}
+
 /// Append a new turn to the board in canonical format.
 ///
 /// The post is the ONLY write the framework makes to the board, and it is done
@@ -180,6 +206,10 @@ pub fn append_turn(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    // Enforce the status vocabulary at the single write seam, so NO caller path
+    // (not just `cmd_post`) can land an invalid status on the board. (Hardening
+    // from Alice's review: validate here, not only at the CLI.)
+    let status = normalize_status(status)?;
     let mut control = format!("status:{status}");
     for who in addressees {
         control.push_str(&format!(" @{who}"));
@@ -387,6 +417,14 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_validation() {
+        assert_eq!(normalize_status("needs-review").unwrap(), "NEEDS-REVIEW");
+        assert_eq!(normalize_status("  done ").unwrap(), "DONE");
+        assert!(normalize_status("REVEIW").is_err()); // typo rejected
+        assert!(normalize_status("").is_err());
     }
 
     #[test]

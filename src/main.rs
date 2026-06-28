@@ -551,6 +551,9 @@ fn cmd_post(
     to: &[String],
     message: Option<String>,
 ) -> Result<()> {
+    // Validate the status up front (before reading stdin) so a typo fails fast
+    // and loudly instead of being silently posted to the board.
+    let status = board::normalize_status(status)?;
     let body = match message {
         Some(m) => m,
         None => {
@@ -572,7 +575,7 @@ fn cmd_post(
         &ts,
         persona,
         subject,
-        &status.to_uppercase(),
+        &status,
         &addressees,
         &body,
     )?;
