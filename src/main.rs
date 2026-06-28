@@ -111,6 +111,33 @@ enum Cmd {
         as_persona: Option<String>,
     },
 
+    /// IRONCLAD loop: supervise an agent. spriff stays running and RE-INVOKES the
+    /// agent command for one turn whenever a peer posts — so the loop survives the
+    /// agent stopping, timing out, or crashing. The supervisor is the daemon; the
+    /// agent runs per turn. Example: `spriff serve --as Alice -- codex exec`.
+    Serve {
+        #[arg(long)]
+        collab: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long = "as")]
+        as_persona: Option<String>,
+        /// Stand down after this many seconds with no peer turn (0 = run forever).
+        #[arg(long, default_value_t = 0)]
+        idle_timeout: u64,
+        /// Poll interval in seconds.
+        #[arg(long, default_value_t = 2)]
+        poll: u64,
+        /// Don't make an opening/catch-up invocation at startup; only react to
+        /// future peer turns.
+        #[arg(long)]
+        no_kickoff: bool,
+        /// The agent command to run per turn (everything after `--`). spriff
+        /// appends a wake prompt as the final argument. e.g. `-- claude -p`.
+        #[arg(last = true, required = true)]
+        agent_cmd: Vec<String>,
+    },
+
     /// Append a turn to the board in canonical grammar.
     Post {
         #[arg(long)]
@@ -236,6 +263,27 @@ fn main() -> Result<()> {
             let (cfg, _name) = resolve(collab, config)?;
             let persona = resolve_persona(as_persona, &cfg);
             watcher::run(&cfg, &persona)
+        }
+        Cmd::Serve {
+            collab,
+            config,
+            as_persona,
+            idle_timeout,
+            poll,
+            no_kickoff,
+            agent_cmd,
+        } => {
+            let (cfg, name) = resolve(collab, config)?;
+            let persona = resolve_persona(as_persona, &cfg);
+            cmd_serve(
+                &cfg,
+                &name,
+                &persona,
+                idle_timeout,
+                poll,
+                !no_kickoff,
+                &agent_cmd,
+            )
         }
         Cmd::Post {
             collab,
@@ -477,38 +525,56 @@ fn cmd_join(
         })
         .unwrap_or_else(|| "default".to_string());
 
+    // Roster slots are FIXED: executor=0, reviewer=1. Only the *source* of each
+    // name varies by role — `--as` names MY slot, `--with` names my peer's.
+    // (Alice's catch: a role-dependent slot tuple double-switched and mis-assigned.)
+    let (my_slot, peer_slot) = if is_impl {
+        (0usize, 1usize)
+    } else {
+        (1usize, 0usize)
+    };
+
     // Create it if it doesn't exist yet (first agent to join wins; idempotent).
-    // Custom names (--as / --with) override the auto-assigned roster by role:
-    // implementer = executor (index 0), reviewer = index 1.
     if !registry::config_path(&name).exists() {
         let mut roster = build_roster(agents.max(2), None, &[]);
-        let (exec_slot, rev_slot) = if is_impl {
-            (0usize, 1usize)
-        } else {
-            (1usize, 0usize)
-        };
         if let Some(n) = &as_name {
-            roster[if is_impl { exec_slot } else { rev_slot }] = n.clone();
+            roster[my_slot] = n.clone();
         }
         if let Some(n) = &with {
-            roster[if is_impl { rev_slot } else { exec_slot }] = n.clone();
+            roster[peer_slot] = n.clone();
         }
         create_collab(&name, &roster, None)?;
     }
     let cfg = Config::load(&registry::config_path(&name))?;
 
-    // Claim the role's persona. An explicit --as wins (you named yourself);
-    // otherwise it's the role's roster slot (implementer = index 0, reviewer = 1).
-    let persona = match as_name {
-        Some(n) => n,
-        None => (if is_impl {
-            cfg.agents.first()
-        } else {
-            cfg.agents.get(1)
-        })
+    // The canonical persona for my role IS the roster slot. Identity must stay
+    // canonical or every downstream invariant (peers, sidecars, addressees, turn
+    // filtering) breaks — so validate any explicit names against the roster and
+    // hard-error on a mismatch rather than writing an off-roster marker.
+    let slot_persona = cfg
+        .agents
+        .get(my_slot)
         .map(|a| a.persona.clone())
-        .ok_or_else(|| anyhow::anyhow!("collaboration '{name}' has no slot for role '{role}'"))?,
-    };
+        .ok_or_else(|| anyhow::anyhow!("collaboration '{name}' has no slot for role '{role}'"))?;
+    if let Some(n) = &as_name {
+        if !n.eq_ignore_ascii_case(&slot_persona) {
+            anyhow::bail!(
+                "--as {n} doesn't match the {role} on '{name}' (that role is {slot_persona}). \
+                 Pick the right --role, or the canonical name.",
+            );
+        }
+    }
+    if let Some(n) = &with {
+        if let Some(peer) = cfg.agents.get(peer_slot) {
+            if !n.eq_ignore_ascii_case(&peer.persona) {
+                anyhow::bail!(
+                    "--with {n} doesn't match the peer on '{name}' (that's {}).",
+                    peer.persona
+                );
+            }
+        }
+    }
+    let persona = slot_persona;
 
     // Write the repo marker so bare `spriff` commands here act as this persona.
     let repo = repo
@@ -753,6 +819,104 @@ fn cmd_wait(cfg: &Config, persona: &str, timeout_secs: u64, interval_secs: u64) 
         }
         std::thread::sleep(interval);
     }
+}
+
+/// Supervise an agent: re-invoke `agent_cmd` for one turn whenever a peer posts.
+///
+/// THIS is what makes the loop ironclad. A CLI agent is not a daemon — left to
+/// loop on `spriff wait` it can stop, time out, or crash and silently strand the
+/// collaboration. Here spriff is the persistent process (itself OS-supervisable
+/// via launchd/systemd) and the agent is invoked per turn, so a dead agent is
+/// just re-spawned on the next peer turn. The agent does ONE turn and exits; we
+/// dedup on the latest peer header so an agent that forgets to `ack` is not
+/// re-invoked in a spin.
+fn cmd_serve(
+    cfg: &Config,
+    name: &str,
+    persona: &str,
+    idle_timeout: u64,
+    poll: u64,
+    kickoff: bool,
+    agent_cmd: &[String],
+) -> Result<()> {
+    let interval = Duration::from_secs(poll.max(1));
+    eprintln!(
+        "[spriff] serving {persona} on '{name}': invoking `{}` for each peer turn (poll {poll}s, idle_timeout {idle_timeout}s)",
+        agent_cmd.join(" ")
+    );
+
+    let mut last_served = String::new();
+
+    // Kickoff: an opening invocation so an implementer can LEAD (post the first
+    // turn with no peer turn waiting) and a reviewer can catch up on anything
+    // already on the board.
+    if kickoff {
+        eprintln!("[spriff] kickoff invocation…");
+        run_agent(agent_cmd, &kickoff_prompt(name, persona))?;
+        if let Some(t) = current_delta(cfg, persona)?.last() {
+            last_served = t.header(); // don't immediately re-serve what kickoff saw
+        }
+    }
+
+    let mut idle_since = Instant::now();
+    loop {
+        let turns = current_delta(cfg, persona)?;
+        match turns.last() {
+            Some(t) if t.header() != last_served => {
+                eprintln!(
+                    "[spriff] peer turn detected -> invoking agent ({} new)",
+                    turns.len()
+                );
+                run_agent(agent_cmd, &wake_prompt(name, persona, turns.len()))?;
+                last_served = t.header();
+                idle_since = Instant::now();
+            }
+            _ => {
+                if idle_timeout > 0 && idle_since.elapsed().as_secs() >= idle_timeout {
+                    eprintln!("[spriff] no peer turn for {idle_timeout}s — standing down.");
+                    return Ok(());
+                }
+                std::thread::sleep(interval);
+            }
+        }
+    }
+}
+
+/// Run the agent command once, appending the wake prompt as the final argument,
+/// inheriting stdio so the operator sees the agent work. Waits for it to exit.
+fn run_agent(agent_cmd: &[String], prompt: &str) -> Result<()> {
+    let (prog, args) = agent_cmd
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty agent command"))?;
+    let status = std::process::Command::new(prog)
+        .args(args)
+        .arg(prompt)
+        .status()
+        .with_context(|| format!("running agent command `{prog}`"))?;
+    if !status.success() {
+        eprintln!("[spriff] agent exited with {status}");
+    }
+    Ok(())
+}
+
+fn wake_prompt(name: &str, persona: &str, n: usize) -> String {
+    format!(
+        "You are {persona}, an agent on the spriff collaboration '{name}'. {n} new peer \
+         turn(s) are waiting. Do exactly ONE turn now: run `spriff inbox` to read them, \
+         do the work they ask for, then `spriff post -s \"...\" --status <STATUS>` (pipe the \
+         body via a quoted heredoc, never -m \"...\"), then `spriff ack`. Run `spriff skill` \
+         if you need the protocol. If the task is fully complete, post with --status DONE."
+    )
+}
+
+fn kickoff_prompt(name: &str, persona: &str) -> String {
+    format!(
+        "You are {persona}, an agent on the spriff collaboration '{name}'. Assess the board \
+         with `spriff status` and `spriff inbox`. If a peer turn is waiting, handle it (read, \
+         do the work, `spriff post` your reply, `spriff ack`). If you are the implementer and \
+         nothing is waiting, make the opening move: post your intro/plan and begin. Run \
+         `spriff skill` for the protocol. Do one turn, then exit."
+    )
 }
 
 fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {

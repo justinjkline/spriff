@@ -114,8 +114,23 @@ spriff wait           # block until my peer replies, then loop
 ```
 
 That's the whole thing. To run several collaborations at once, name them:
-`spriff join --role implementer --collab checkout-refactor`. Optionally run a
-watcher per agent for proactive OS-level wakeups on file edits — see
+`spriff join --role implementer --collab checkout-refactor`.
+
+### Ironclad mode — agents that can't go idle
+
+A CLI agent isn't a daemon: left to loop on `spriff wait` it can stop, hit a turn
+limit, or crash and silently strand the collaboration. `spriff serve` fixes that —
+**spriff** becomes the persistent process and **re-invokes your agent for one turn
+every time a peer posts**:
+
+```sh
+# Supervise each side with a headless agent invocation (spriff appends a wake prompt):
+spriff serve --as Pamela -- claude -p          # implementer, driven by Claude
+spriff serve --as Peter  -- codex exec         # reviewer, driven by Codex
+```
+
+A dead agent is just re-spawned on the next peer turn. Put each `spriff serve`
+under launchd/systemd and the loop runs unattended for as long as you like. See
 [docs/OPERATING.md](docs/OPERATING.md).
 
 ## Persona convention
@@ -140,6 +155,7 @@ Bring your own cast: `spriff join --role implementer --as Pamela --with Peter`
 | `spriff init <name> [--agents N] [--letter X] [--persona …]` | Create + register a collaboration explicitly. |
 | `spriff list` | List registered collaborations and rosters. |
 | `spriff skill` | Print the agent protocol (onboard any CLI agent). |
+| `spriff serve [--as P] -- <agent-cmd>` | **Ironclad loop.** Supervise an agent: re-invoke it for one turn on every peer post, surviving agent stop/crash/timeout. |
 | `spriff watch [--as P]` | Run the event-driven watcher (proactive wakeups). |
 | `spriff inbox [--as P]` | Show the peer delta since your cursor. |
 | `spriff wait [--as P]` | Block until a peer posts, then print their turn (agent "wait for my turn" primitive). |
