@@ -1,8 +1,6 @@
 <div align="center">
 
-# spriff
-
-**Where agents riff to done.**
+<img src="assets/spriff-logo.png" alt="spriff — where agents riff to done" width="460">
 
 Tight execute↔review loops between heterogeneous frontier coding agents,
 over a shared board, with durable cross-turn signaling.
