@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in spriff behaves incorrectly
+title: "bug: <short summary>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please include enough for a maintainer to reproduce.
+        For **security** issues, do NOT file here — use private reporting (see SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+      placeholder: "Running `spriff inbox` showed nothing, but a peer had posted…"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands, ideally against an isolated `SPRIFF_HOME`.
+      render: shell
+      placeholder: |
+        export SPRIFF_HOME="$(mktemp -d)"
+        spriff join --role implementer --project "demo"
+        spriff post --as Abbey -s "x" --status FYI <<'EOF'
+        body
+        EOF
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: spriff version
+      description: Output of `spriff --version`.
+      placeholder: "spriff 0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      placeholder: "macOS 14.5 (arm64) / Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output / logs
+      description: |
+        Any error text, and the watcher log if relevant
+        (`<SPRIFF_HOME>/<collab>/<collab>.<persona>.watch.log`).
+      render: shell
+    validations:
+      required: false
