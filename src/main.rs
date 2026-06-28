@@ -88,6 +88,16 @@ enum Cmd {
         as_persona: Option<String>,
     },
 
+    /// Health-check a collaboration: registry, resolved identity + source, board
+    /// state, per-persona unread/cursor, whether a `serve` supervisor is running,
+    /// and roster/identity sanity warnings. Run it when something seems off.
+    Doctor {
+        #[arg(long)]
+        collab: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
     /// Print the agent collaboration protocol (the SKILL file). Point any CLI
     /// agent at `spriff skill` to onboard it.
     Skill,
@@ -314,6 +324,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Doctor { collab, config } => cmd_doctor(collab, config),
         Cmd::Skill => {
             print!("{SKILL}");
             Ok(())
@@ -1260,6 +1271,118 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
         println!("  inbox:      {new} new peer turn(s) waiting — run `spriff inbox`");
     } else {
         println!("  inbox:      clear");
+    }
+    Ok(())
+}
+
+/// Is a `serve` supervisor currently holding the lock for this persona? Probes
+/// the advisory lock non-destructively: if we CAN'T take it, someone holds it.
+fn is_serve_running(board: &std::path::Path, persona: &str) -> bool {
+    use fs2::FileExt;
+    let path = serve_lock_path(board, persona);
+    if !path.exists() {
+        return false;
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        // try_lock succeeded => nobody held it (we now hold it; drop releases it).
+        Ok(f) => f.try_lock_exclusive().is_err(),
+        Err(_) => false,
+    }
+}
+
+/// Health-check: aggregate the state an operator needs when something seems off —
+/// registry, the cwd's resolved identity (the #1 footgun), board + per-persona
+/// unread/cursor, whether a `serve` is running, and roster/identity warnings.
+fn cmd_doctor(collab: Option<String>, config: Option<PathBuf>) -> Result<()> {
+    let mut warnings: Vec<String> = Vec::new();
+    println!("spriff doctor\n=============");
+
+    // Registry overview.
+    println!("\nregistry: {}", registry::root().display());
+    let names = registry::list();
+    if names.is_empty() {
+        println!("  (no collaborations registered)");
+    }
+    for n in &names {
+        match Config::load(&registry::config_path(n)) {
+            Ok(c) => {
+                let roster: Vec<&str> = c.agents.iter().map(|a| a.persona.as_str()).collect();
+                println!("  {n}  [{}]", roster.join(", "));
+            }
+            Err(_) => {
+                println!("  {n}  (config unreadable)");
+                warnings.push(format!("config for '{n}' is unreadable"));
+            }
+        }
+    }
+
+    // The active collaboration for THIS directory + identity (the common footgun).
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    println!("\nthis directory: {cwd}");
+    match resolve(collab, config) {
+        Err(e) => println!("  (no active collaboration: {e})"),
+        Ok((cfg, name)) => {
+            let (persona, source) = resolve_persona_with_source(None, &cfg);
+            let on_roster = cfg
+                .agents
+                .iter()
+                .any(|a| a.persona.eq_ignore_ascii_case(&persona));
+            println!("  resolves to: '{name}' as '{persona}' (identity from {source})");
+            if !on_roster {
+                warnings.push(format!(
+                    "resolved persona '{persona}' is NOT on the '{name}' roster — peer posts will look empty/wrong (use --as or $SPRIFF_AS)"
+                ));
+            }
+
+            let board = cfg.board_path();
+            println!(
+                "  board: {} ({} bytes)",
+                board.display(),
+                board::board_size(&board)
+            );
+            if let Some(m) = read_mission(&board) {
+                let line = m.lines().next().unwrap_or("");
+                let shown: String = line.chars().take(80).collect();
+                println!(
+                    "  mission: {shown}{}",
+                    if line.len() > 80 { "…" } else { "" }
+                );
+            }
+            println!("  agents:");
+            for a in &cfg.agents {
+                let sc = Sidecars::derive(&board, &a.persona);
+                let st = state::WatchState::load(&sc.state);
+                let unread = board::delta_since(&board, st.offset, &a.persona)
+                    .map(|t| t.len())
+                    .unwrap_or(0);
+                let serving = if is_serve_running(&board, &a.persona) {
+                    " · serve RUNNING"
+                } else {
+                    ""
+                };
+                let role = a.role.clone().unwrap_or_default();
+                println!(
+                    "    {} ({role}): {unread} unread · cursor={}{serving}",
+                    a.persona, st.offset
+                );
+            }
+        }
+    }
+
+    println!();
+    if warnings.is_empty() {
+        println!("✓ no problems detected");
+    } else {
+        println!("⚠ {} warning(s):", warnings.len());
+        for w in &warnings {
+            println!("  - {w}");
+        }
     }
     Ok(())
 }
