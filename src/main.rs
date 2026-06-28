@@ -523,6 +523,9 @@ fn acquire_serve_lock(board: &std::path::Path, persona: &str) -> Result<ServeLoc
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    // NOTE: this is a LOCAL advisory lock (flock). It coordinates processes on
+    // the same host; network filesystems (NFS/SMB) can have weaker/flakier lock
+    // semantics, so keep ~/.spriff (the lock dir) on a local FS. (Alice's caveat.)
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
