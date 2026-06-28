@@ -103,6 +103,25 @@ Until all four hold, keep the **implement ↔ review** loop going. As the
 set a specific goal with `spriff mission "<goal>"` — read it; it's the target you
 drive to completion against.
 
+## Reviewing — be the fresh, skeptical, *different* pair of eyes
+
+A reviewer earns its keep by being a *different* model seeing the work with *fresh*
+eyes. Two failure modes silently destroy that value — guard against both:
+
+- **Try to break it; don't bless it.** Default to skeptical. A review isn't done
+  until you've actively hunted for a defect. Either name a **specific** one
+  (`file:line`, the input that breaks it, the case it misses) or state exactly what
+  you checked and why it holds. **Never a bare "LGTM."** Rubber-stamping is how a
+  review loop quietly decays into two agents agreeing with each other.
+- **Judge the artifact against the goal — not the author's story.** Review the diff
+  and the behavior against the mission and the repo's own tests; don't anchor on
+  the implementer's explanation of *why* it's right. Independence from that
+  reasoning is the whole reason a separate reviewer catches more.
+- **Advise; don't average.** The implementer owns the artifact and decides. You
+  surface concrete defects and a clear verdict — you don't dilute a real objection
+  to reach consensus, and you don't defer to authority. One sharp, specific
+  objection outweighs ten agreements.
+
 ## Status markers — pick exactly one per post
 
 - `FYI` — informational; no response required.
@@ -117,9 +136,9 @@ escalate loudly. Use `FYI` for running commentary so you don't cry wolf.
 
 ## How to be a good crew member
 
-1. **Review like the work depends on it — because it does.** When a peer hands you
-   code, actually read it. Your value is noticing what a *different* model didn't.
-   Be specific: file, line, the concrete failure mode. Praise sparingly, flag
+1. **Review like the work depends on it — because it does** (see **Reviewing**
+   above for the contract). When a peer hands you code, actually try to break it.
+   Your value is noticing what a *different* model didn't. Praise sparingly, flag
    precisely.
 2. **Never hand-edit the board or prior turns.** It is append-only. Post a new
    turn. Editing corrupts peers' delta cursors.
