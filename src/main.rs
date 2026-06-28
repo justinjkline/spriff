@@ -498,10 +498,15 @@ fn read_mission(board: &std::path::Path) -> Option<String> {
 /// Resolve (config, name) from optional flags, honouring the registry priority
 /// order. An explicit `--config <path>` short-circuits name resolution.
 fn resolve(collab: Option<String>, config: Option<PathBuf>) -> Result<(Config, String)> {
-    // An explicit --config short-circuits; so does $SPRIFF_CONFIG, which is how a
-    // `spriff serve --config <path>` supervisor propagates a non-registry config
-    // to its supervised child's bare `spriff` commands.
+    // Precedence: explicit `--config` wins outright. `$SPRIFF_CONFIG` (how a
+    // `serve --config` supervisor propagates a non-registry config to its child)
+    // applies ONLY when neither `--config` nor an explicit `--collab` is given —
+    // so a deliberate `--collab other` always outranks an inherited env config.
+    // (Alice's non-blocking note.)
     let config = config.or_else(|| {
+        if collab.is_some() {
+            return None;
+        }
         std::env::var("SPRIFF_CONFIG")
             .ok()
             .filter(|s| !s.is_empty())
@@ -1191,4 +1196,41 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
         println!("  inbox:      clear");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn mission_path_derivation() {
+        assert_eq!(
+            mission_path(Path::new("/x/foo.board.md")),
+            PathBuf::from("/x/foo.mission.md")
+        );
+        assert_eq!(
+            mission_path(Path::new("/x/bar.md")),
+            PathBuf::from("/x/bar.mission.md")
+        );
+    }
+
+    #[test]
+    fn completion_clause_injects_dod_and_mission() {
+        let with = completion_clause(Some("ship checkout"));
+        assert!(with.contains("DRIVE-TO-COMPLETION"));
+        assert!(with.contains("feature-complete"));
+        assert!(with.contains("MISSION: ship checkout."));
+        let without = completion_clause(None);
+        assert!(without.contains("DRIVE-TO-COMPLETION"));
+        assert!(!without.contains("MISSION:"));
+    }
+
+    #[test]
+    fn wake_prompt_tells_supervised_agent_to_exit_not_wait() {
+        let p = wake_prompt("demo", "Alice", 1, None);
+        assert!(p.contains("EXIT"));
+        assert!(p.contains("do NOT run `spriff wait`"));
+        assert!(p.contains("spriff ack"));
+    }
 }
