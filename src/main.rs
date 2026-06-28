@@ -839,83 +839,160 @@ fn cmd_serve(
     kickoff: bool,
     agent_cmd: &[String],
 ) -> Result<()> {
+    // Identity validation at the persistent entry point: refuse to supervise an
+    // off-roster persona (it would act as someone the collaboration doesn't know).
+    if !cfg
+        .agents
+        .iter()
+        .any(|a| a.persona.eq_ignore_ascii_case(persona))
+    {
+        let roster: Vec<&str> = cfg.agents.iter().map(|a| a.persona.as_str()).collect();
+        anyhow::bail!(
+            "persona '{persona}' is not on '{name}' roster [{}]. Use --as <one of them>.",
+            roster.join(", ")
+        );
+    }
+
+    let board_path = cfg.board_path();
+    let sc = Sidecars::derive(&board_path, persona);
     let interval = Duration::from_secs(poll.max(1));
+    const MAX_ATTEMPTS: u32 = 3;
     eprintln!(
-        "[spriff] serving {persona} on '{name}': invoking `{}` for each peer turn (poll {poll}s, idle_timeout {idle_timeout}s)",
+        "[spriff] serving {persona} on '{name}': invoking `{}` per peer turn (poll {poll}s, idle_timeout {idle_timeout}s)",
         agent_cmd.join(" ")
     );
 
-    let mut last_served = String::new();
-
-    // Kickoff: an opening invocation so an implementer can LEAD (post the first
-    // turn with no peer turn waiting) and a reviewer can catch up on anything
-    // already on the board.
+    // Kickoff: an opening invocation so an implementer can LEAD and a reviewer can
+    // catch up on anything already waiting. Completion is judged below, not here.
     if kickoff {
         eprintln!("[spriff] kickoff invocation…");
-        run_agent(agent_cmd, &kickoff_prompt(name, persona))?;
-        if let Some(t) = current_delta(cfg, persona)?.last() {
-            last_served = t.header(); // don't immediately re-serve what kickoff saw
-        }
+        run_agent(agent_cmd, name, persona, &kickoff_prompt(name, persona));
     }
 
     let mut idle_since = Instant::now();
+    let mut current_header = String::new();
+    let mut attempts: u32 = 0;
+
     loop {
         let turns = current_delta(cfg, persona)?;
-        match turns.last() {
-            Some(t) if t.header() != last_served => {
-                eprintln!(
-                    "[spriff] peer turn detected -> invoking agent ({} new)",
-                    turns.len()
-                );
-                run_agent(agent_cmd, &wake_prompt(name, persona, turns.len()))?;
-                last_served = t.header();
-                idle_since = Instant::now();
+        let Some(latest) = turns.last() else {
+            // Nothing waiting. Stand down if idle long enough.
+            if idle_timeout > 0 && idle_since.elapsed().as_secs() >= idle_timeout {
+                eprintln!("[spriff] no peer turn for {idle_timeout}s — standing down.");
+                return Ok(());
             }
-            _ => {
-                if idle_timeout > 0 && idle_since.elapsed().as_secs() >= idle_timeout {
-                    eprintln!("[spriff] no peer turn for {idle_timeout}s — standing down.");
-                    return Ok(());
-                }
-                std::thread::sleep(interval);
-            }
+            std::thread::sleep(interval);
+            continue;
+        };
+        let header = latest.header();
+        if header != current_header {
+            current_header = header.clone();
+            attempts = 0;
         }
+        if attempts >= MAX_ATTEMPTS {
+            // The agent keeps failing to handle this turn. Don't spin or double-post:
+            // back off loudly, then retry (never silently strand it).
+            eprintln!("[spriff] WARNING: agent failed to handle this turn {MAX_ATTEMPTS}x; backing off. Turn: {header}");
+            std::thread::sleep(interval * 5);
+            attempts = 0;
+            continue;
+        }
+        attempts += 1;
+
+        eprintln!(
+            "[spriff] peer turn -> invoking agent (attempt {attempts}, {} new)",
+            turns.len()
+        );
+        run_agent(
+            agent_cmd,
+            name,
+            persona,
+            &wake_prompt(name, persona, turns.len()),
+        );
+
+        // COMPLETION POLICY (not "did the process exit 0"): did the turn actually
+        // get consumed? Only then mark it handled — a failed/crashed invocation is
+        // retried, never marked served. Cursor-based, so it's also restart-safe.
+        let after = current_delta(cfg, persona)?;
+        let still_pending = after.last().map(|t| t.header()) == Some(header.clone());
+        if !still_pending {
+            idle_since = Instant::now();
+            current_header.clear();
+            attempts = 0;
+            continue;
+        }
+        // Safety net: the agent replied but forgot to `ack` (the latest board turn
+        // is now ours). Advance the cursor on its behalf so we don't re-invoke and
+        // double-post.
+        let i_replied = board::last_turn_header(&board_path)
+            .map(|(_, author, _)| author.eq_ignore_ascii_case(persona))
+            .unwrap_or(false);
+        if i_replied {
+            let mut st = state::WatchState::load(&sc.state);
+            st.offset = board::board_size(&board_path);
+            st.last_pending_header = String::new();
+            st.save(&sc.state)?;
+            pending::ack(&sc).ok();
+            eprintln!("[spriff] agent replied without ack; cursor advanced on its behalf.");
+            idle_since = Instant::now();
+            current_header.clear();
+            attempts = 0;
+            continue;
+        }
+        // Genuinely unhandled (no reply): retry with linear backoff.
+        eprintln!("[spriff] turn still unhandled (attempt {attempts}); retrying after backoff.");
+        std::thread::sleep(interval * attempts);
     }
 }
 
-/// Run the agent command once, appending the wake prompt as the final argument,
-/// inheriting stdio so the operator sees the agent work. Waits for it to exit.
-fn run_agent(agent_cmd: &[String], prompt: &str) -> Result<()> {
-    let (prog, args) = agent_cmd
-        .split_first()
-        .ok_or_else(|| anyhow::anyhow!("empty agent command"))?;
-    let status = std::process::Command::new(prog)
+/// Run the agent command once, appending the wake prompt as the final argument
+/// and exporting the agent's identity (SPRIFF_COLLAB/SPRIFF_AS) so its `spriff`
+/// commands resolve correctly regardless of the child's working directory.
+/// Inherits stdio so the operator sees the agent work. Returns process success.
+fn run_agent(agent_cmd: &[String], name: &str, persona: &str, prompt: &str) -> bool {
+    let Some((prog, args)) = agent_cmd.split_first() else {
+        eprintln!("[spriff] empty agent command");
+        return false;
+    };
+    match std::process::Command::new(prog)
         .args(args)
         .arg(prompt)
+        .env("SPRIFF_COLLAB", name)
+        .env("SPRIFF_AS", persona)
         .status()
-        .with_context(|| format!("running agent command `{prog}`"))?;
-    if !status.success() {
-        eprintln!("[spriff] agent exited with {status}");
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("[spriff] agent exited with {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("[spriff] failed to run agent `{prog}`: {e}");
+            false
+        }
     }
-    Ok(())
 }
 
 fn wake_prompt(name: &str, persona: &str, n: usize) -> String {
     format!(
         "You are {persona}, an agent on the spriff collaboration '{name}'. {n} new peer \
-         turn(s) are waiting. Do exactly ONE turn now: run `spriff inbox` to read them, \
-         do the work they ask for, then `spriff post -s \"...\" --status <STATUS>` (pipe the \
-         body via a quoted heredoc, never -m \"...\"), then `spriff ack`. Run `spriff skill` \
-         if you need the protocol. If the task is fully complete, post with --status DONE."
+         turn(s) are waiting. Do exactly ONE turn, then EXIT — do NOT run `spriff wait` or \
+         otherwise idle; the supervisor re-invokes you automatically when your peer next \
+         posts, so idling only wastes tokens (any 'stay in the loop / spriff wait' note from \
+         `spriff skill` does NOT apply while supervised). The turn: run `spriff inbox` to read \
+         the new turn(s), do the work, post your reply with `spriff post -s \"...\" --status \
+         <STATUS>` (body via a quoted heredoc, never -m \"...\"), then `spriff ack`. Use \
+         --status DONE if the task is fully complete. Then exit."
     )
 }
 
 fn kickoff_prompt(name: &str, persona: &str) -> String {
     format!(
-        "You are {persona}, an agent on the spriff collaboration '{name}'. Assess the board \
-         with `spriff status` and `spriff inbox`. If a peer turn is waiting, handle it (read, \
-         do the work, `spriff post` your reply, `spriff ack`). If you are the implementer and \
-         nothing is waiting, make the opening move: post your intro/plan and begin. Run \
-         `spriff skill` for the protocol. Do one turn, then exit."
+        "You are {persona}, an agent on the spriff collaboration '{name}'. Assess with `spriff \
+         status` and `spriff inbox`. If a peer turn is waiting, handle it (read, work, `spriff \
+         post`, `spriff ack`). If you are the implementer and nothing is waiting, make the \
+         opening move (post your intro/plan). Do exactly ONE turn, then EXIT — do NOT run \
+         `spriff wait`; the supervisor re-invokes you when your peer posts."
     )
 }
 

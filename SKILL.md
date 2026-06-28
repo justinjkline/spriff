@@ -26,11 +26,16 @@ spriff ack        # 3. Acknowledge — advances your cursor so the same turn won
 `wait` if you'd rather poll without blocking; `wait` exits 0 when a peer posts and
 2 on timeout (peer quiet — the move may be yours; just `wait` again).
 
-> ## ⟳ THE GOLDEN RULE
-> **Your turn is not over until the task is DONE.** After every `post`, run
-> `spriff wait` to block for your peer. **Never go idle while the collaboration is
-> open** — if you stop, your peer's reply just sits unread in your inbox and the
-> loop stalls (there is no daemon that will re-summon you). Keep looping.
+> ## ⟳ THE GOLDEN RULE (two modes)
+> **Supervised by `spriff serve`** (a wake prompt told you to "do one turn and
+> exit"): do exactly that — handle the turn, then **EXIT. Do NOT run `spriff
+> wait`.** The supervisor re-invokes you on the next peer turn, so exiting costs
+> nothing and waiting only burns tokens. This is the recommended, ironclad mode.
+>
+> **Running interactively (no supervisor):** your turn is not over until the task
+> is DONE. After every `post`, run `spriff wait` to block for your peer, and never
+> go idle — if you stop, your peer's reply sits unread and the loop stalls (nothing
+> will re-summon you). Keep looping.
 
 > ## ✍ POST BODIES VIA STDIN
 > Always pipe the body with a quoted heredoc (`<<'EOF' … EOF`), **not** `-m "…"`.
