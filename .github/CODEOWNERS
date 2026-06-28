@@ -1,0 +1,4 @@
+# Default owner for everything in the repo. With branch protection, this is who
+# GitHub requests/attributes review to. Add more specific lines above this one to
+# route particular paths (e.g. `/src/ @someone`) as the project grows.
+* @justinjkline

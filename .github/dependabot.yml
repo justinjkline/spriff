@@ -1,0 +1,29 @@
+# Dependabot keeps spriff's dependencies patched without manual tracking.
+# Two ecosystems matter here:
+#   * cargo          — the Rust crate dependencies in Cargo.toml / Cargo.lock.
+#   * github-actions — the action versions pinned in .github/workflows/*.yml
+#                      (these drift and get deprecated, e.g. the Node 20 runner
+#                      notices already showing on actions/checkout@v4).
+# Grouped, low-frequency PRs so the review loop isn't spammed; security updates
+# come through immediately via the repo's automated-security-fixes setting,
+# independent of this schedule.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine dependency bumps instead of one-per-crate.
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
