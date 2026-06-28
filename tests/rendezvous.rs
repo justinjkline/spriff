@@ -408,3 +408,116 @@ fn concurrent_same_project_joins_converge_on_one_board() {
         stdout(&o2)
     );
 }
+
+// ---------------------------------------------------------------------------
+// 7. --lens is reviewer-only: an implementer that passes it is rejected loudly.
+// ---------------------------------------------------------------------------
+#[test]
+fn lens_is_rejected_for_the_implementer() {
+    let sb = Sandbox::new("lensimpl");
+    let a = sb.cwd("impl");
+    let o = sb.run(
+        &a,
+        &[
+            "join",
+            "--role",
+            "implementer",
+            "--project",
+            "demo",
+            "--lens",
+            "security",
+        ],
+    );
+    assert!(!o.status.success(), "implementer --lens must be rejected");
+    assert!(
+        stderr(&o).contains("--lens is for reviewers only"),
+        "error should explain the lens is reviewer-only:\n{}",
+        stderr(&o)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. The SECOND reviewer in a 3-agent crew can join via --as and declare a lens
+//    (Alice's catch: join used to hardcode any reviewer to roster slot 1).
+// ---------------------------------------------------------------------------
+#[test]
+fn second_reviewer_can_join_and_declare_a_lens() {
+    let sb = Sandbox::new("tworev");
+    let (a, b, c) = (sb.cwd("impl"), sb.cwd("rev1"), sb.cwd("rev2"));
+
+    // Implementer creates a 3-agent crew: Abbey (exec), Alice + Annie (reviewers).
+    assert!(sb
+        .run(
+            &a,
+            &[
+                "join",
+                "--role",
+                "implementer",
+                "--as",
+                "Abbey",
+                "--with",
+                "Alice",
+                "--project",
+                "trio",
+                "--agents",
+                "3"
+            ],
+        )
+        .status
+        .success());
+
+    // First reviewer joins slot 1.
+    let r1 = sb.run(
+        &b,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Alice",
+            "--with",
+            "Abbey",
+            "--project",
+            "trio",
+            "--lens",
+            "security",
+        ],
+    );
+    assert!(
+        r1.status.success(),
+        "first reviewer join failed: {}",
+        stderr(&r1)
+    );
+
+    // SECOND reviewer (slot 2) must now be able to join and declare its lens.
+    let r2 = sb.run(
+        &c,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Annie",
+            "--with",
+            "Abbey",
+            "--project",
+            "trio",
+            "--lens",
+            "correctness",
+        ],
+    );
+    assert!(
+        r2.status.success(),
+        "second reviewer join failed: {}",
+        stderr(&r2)
+    );
+    assert!(
+        marker(&c).contains("as=Annie"),
+        "rev2 marker should be Annie: {}",
+        marker(&c)
+    );
+
+    // Each reviewer's declared lens is visible via status; the two are distinct.
+    assert!(stdout(&sb.run(&b, &["status", "--as", "Alice"])).contains("security"));
+    assert!(stdout(&sb.run(&c, &["status", "--as", "Annie"])).contains("correctness"));
+}

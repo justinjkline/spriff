@@ -1012,6 +1012,31 @@ fn slugify(s: &str) -> String {
     }
 }
 
+/// Which roster slot a joining agent claims. PURE + testable. A reviewer is NOT
+/// necessarily slot 1: in a 3+ crew, a reviewer who names itself with `--as` binds
+/// to THAT reviewer's slot so the 2nd, 3rd, … reviewer can actually join. The
+/// executor slot (0) is never a valid reviewer target, so an `--as` that resolves
+/// to slot 0 falls back to the default and the caller's validation rejects it.
+/// (Alice's catch: join hardcoded reviewer → slot 1, so a second reviewer's
+/// `--as Annie` failed against slot 1 = Alice.)
+fn resolve_my_slot(
+    is_review: bool,
+    as_name: Option<&str>,
+    default_slot: usize,
+    roster: &[String],
+) -> usize {
+    if is_review {
+        if let Some(idx) =
+            as_name.and_then(|n| roster.iter().position(|p| p.eq_ignore_ascii_case(n)))
+        {
+            if idx != 0 {
+                return idx;
+            }
+        }
+    }
+    default_slot
+}
+
 /// The board to join when the agent gave no explicit signal: the single
 /// registered collaboration, or "default" if none — but if SEVERAL exist, refuse
 /// to guess (which would silently join the wrong board) and ask for disambiguation.
@@ -1052,6 +1077,15 @@ fn cmd_join(
     let is_review = matches!(role_norm.as_str(), "reviewer" | "review" | "qa" | "critic");
     if !is_impl && !is_review {
         anyhow::bail!("unknown role '{role}'. Use --role implementer or --role reviewer.");
+    }
+    // A review lens is meaningless for the implementer — reject it loudly rather
+    // than silently writing a lens an implementer would then carry into serve/status
+    // surfaces. (Alice's catch: --lens leaked onto non-reviewers.)
+    if lens.is_some() && !is_review {
+        anyhow::bail!(
+            "--lens is for reviewers only — role '{role}' is the implementer, and a review lens \
+             has no meaning for the agent doing the building."
+        );
     }
 
     // Resolve which board to join, in priority order:
@@ -1127,6 +1161,12 @@ fn cmd_join(
         }
         Ok((cfg, created))
     })?;
+
+    // Re-resolve MY slot now that the roster is known: a reviewer that named
+    // itself with --as binds to that reviewer's slot, so the 2nd+ reviewer in a 3+
+    // crew can join (not just slot 1). (Alice's catch.)
+    let roster_personas: Vec<String> = cfg.agents.iter().map(|a| a.persona.clone()).collect();
+    let my_slot = resolve_my_slot(is_review, as_name.as_deref(), my_slot, &roster_personas);
 
     // The canonical persona for my role IS the roster slot. Identity must stay
     // canonical or every downstream invariant (peers, sidecars, addressees, turn
@@ -1538,8 +1578,13 @@ fn cmd_serve(
     let interval = Duration::from_secs(poll.max(1));
     const MAX_ATTEMPTS: u32 = 3;
     let mission = read_mission(&cfg.board_path());
-    // A reviewer's declared lens (if any) focuses its supervised wake prompt.
-    let lens = resolve_lens(cfg, &cfg.board_path(), persona);
+    // A reviewer's declared lens (if any) focuses its supervised wake prompt — and
+    // ONLY a reviewer's: an implementer must never get review-lens prompt text.
+    let lens = if cfg.role_of(persona).as_deref() == Some("reviewer") {
+        resolve_lens(cfg, &cfg.board_path(), persona)
+    } else {
+        None
+    };
     eprintln!(
         "[spriff] serving {persona} on '{name}': invoking `{}` per peer turn (poll {poll}s, idle_timeout {idle_timeout}s){}",
         agent_cmd.join(" "),
@@ -1749,8 +1794,11 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
     if let Some(c) = resolve_class(cfg, &board_path, persona) {
         println!("  class:      {c}");
     }
-    if let Some(l) = resolve_lens(cfg, &board_path, persona) {
-        println!("  lens:       {l}");
+    // A lens is a reviewer-only concept — never surface one for the implementer.
+    if cfg.role_of(persona).as_deref() == Some("reviewer") {
+        if let Some(l) = resolve_lens(cfg, &board_path, persona) {
+            println!("  lens:       {l}");
+        }
     }
     println!("  board:      {} ({} bytes)", board_path.display(), size);
     println!("  cursor:     offset={}", st.offset);
@@ -1890,7 +1938,13 @@ fn cmd_doctor(
                     .as_deref()
                     .map(|c| format!(" · class={c}"))
                     .unwrap_or_default();
-                let lens = resolve_lens(&cfg, &board, &a.persona);
+                let is_reviewer = role.eq_ignore_ascii_case("reviewer");
+                // Lens is a reviewer-only concept — only resolve/show it for reviewers.
+                let lens = if is_reviewer {
+                    resolve_lens(&cfg, &board, &a.persona)
+                } else {
+                    None
+                };
                 let lens_str = lens
                     .as_deref()
                     .map(|l| format!(" · lens={l}"))
@@ -1900,7 +1954,7 @@ fn cmd_doctor(
                     a.persona, st.offset
                 );
                 roster_classes.push((a.persona.clone(), class));
-                if role.eq_ignore_ascii_case("reviewer") {
+                if is_reviewer {
                     reviewer_lenses.push((a.persona.clone(), lens));
                 }
             }
@@ -2125,6 +2179,27 @@ mod tests {
         assert_eq!(slugify("My Project"), slugify("my   project"));
         // Never empty.
         assert_eq!(slugify("***"), "project");
+    }
+
+    #[test]
+    fn resolve_my_slot_binds_reviewer_to_its_named_slot() {
+        let roster = vec![
+            "Abbey".to_string(),
+            "Alice".to_string(),
+            "Annie".to_string(),
+        ];
+        // Implementer keeps slot 0.
+        assert_eq!(resolve_my_slot(false, Some("Abbey"), 0, &roster), 0);
+        // The bug fix: a reviewer naming the SECOND reviewer binds to slot 2.
+        assert_eq!(resolve_my_slot(true, Some("Annie"), 1, &roster), 2);
+        // First reviewer -> slot 1; case-insensitive.
+        assert_eq!(resolve_my_slot(true, Some("alice"), 1, &roster), 1);
+        // No --as -> default first-reviewer slot.
+        assert_eq!(resolve_my_slot(true, None, 1, &roster), 1);
+        // A reviewer naming the executor (slot 0) falls back to default so the
+        // caller's cross-role validation rejects it; an unknown name does too.
+        assert_eq!(resolve_my_slot(true, Some("Abbey"), 1, &roster), 1);
+        assert_eq!(resolve_my_slot(true, Some("Zed"), 1, &roster), 1);
     }
 
     #[test]
