@@ -155,6 +155,19 @@ enum Cmd {
         interval: u64,
     },
 
+    /// Declare source paths you're touching, so your peers' watchers wake on your
+    /// real edits (not just board posts). Appends to your watchpaths sidecar.
+    Touching {
+        /// One or more paths (files or dirs) you're working in.
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        collab: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long = "as")]
+        as_persona: Option<String>,
+    },
+
     /// Acknowledge the current pending signal (archive it) after responding.
     Ack {
         #[arg(long)]
@@ -248,6 +261,16 @@ fn main() -> Result<()> {
             let (cfg, _name) = resolve(collab, config)?;
             let persona = resolve_persona(as_persona, &cfg);
             cmd_wait(&cfg, &persona, timeout, interval)
+        }
+        Cmd::Touching {
+            paths,
+            collab,
+            config,
+            as_persona,
+        } => {
+            let (cfg, _name) = resolve(collab, config)?;
+            let persona = resolve_persona(as_persona, &cfg);
+            cmd_touching(&cfg, &persona, &paths)
         }
         Cmd::Ack {
             collab,
@@ -487,16 +510,30 @@ fn cmd_join(
     print!("{SKILL}");
     println!("\n──────────────────────────── your first move ────────────────────────────");
     if is_impl {
-        println!("You drive implementation. Build a first coherent chunk, then:");
-        println!("    spriff post -s \"<what you did>\" --status NEEDS-REVIEW -m \"<summary + files/lines to scrutinize>\"");
-        println!("    spriff wait        # hands off and blocks until your reviewer replies");
+        println!("1. Introduce yourself + declare the files you're touching:");
+        println!("     spriff post -s \"intro\" --status FYI -m \"<who you are + your plan>\"");
+        println!(
+            "     spriff touching <path> [<path>...]   # so your reviewer is woken on your edits"
+        );
+        println!("2. Implement a coherent chunk, then hand off for review:");
+        println!("     spriff post -s \"<what you did>\" --status NEEDS-REVIEW -m \"<summary + files/lines to scrutinize>\"");
+        println!("     spriff wait        # blocks until your reviewer replies");
     } else {
-        println!("You review. Block until the implementer posts their first turn:");
-        println!("    spriff wait");
-        println!("Then read the code they reference, and:");
-        println!("    spriff post -s \"review: <area>\" --status NEEDS-REVIEW -m \"<file:line + the concrete issue>\"");
-        println!("    spriff ack");
+        println!("1. Introduce yourself, then start your continuous watcher (this IS your");
+        println!("   \"watch script\" — recursive + event-driven; do NOT hand-write one):");
+        println!(
+            "     spriff post -s \"intro\" --status FYI -m \"<who you are + your review bar>\""
+        );
+        println!(
+            "     spriff watch &     # wakes you on board posts AND the implementer's file edits"
+        );
+        println!("2. When the implementer hands off, review the code they reference, then:");
+        println!("     spriff post -s \"review: <area>\" --status NEEDS-REVIEW -m \"<file:line + the concrete issue>\"");
+        println!("     spriff ack");
     }
+    println!("\nTip: `spriff watch &` in the background gives the tight feedback loop —");
+    println!("it's the recursive 'watch script', already built. Use `spriff wait` to block");
+    println!("for a single turn. Run `spriff skill` anytime to re-read the protocol.");
     Ok(())
 }
 
@@ -627,6 +664,36 @@ fn cmd_inbox(cfg: &Config, persona: &str) -> Result<()> {
         return Ok(());
     }
     print_delta(&turns);
+    Ok(())
+}
+
+/// Declare source paths this persona is touching, by appending to its watchpaths
+/// sidecar. A peer's `spriff watch` reads this and wakes on real edits there.
+fn cmd_touching(cfg: &Config, persona: &str, paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        anyhow::bail!("give at least one path: spriff touching <path> [<path>...]");
+    }
+    let sc = Sidecars::derive(&cfg.board_path(), persona);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut added = 0;
+    for p in paths {
+        // Resolve relative paths against cwd so the entry is unambiguous, but do
+        // not require the path to exist yet (an agent may declare it up front).
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        };
+        if paths::add_watchpath(&sc.watchpaths, &abs)? {
+            println!("  watching: {}", abs.display());
+            added += 1;
+        }
+    }
+    println!(
+        "declared {added} new path(s) for {persona} in {}",
+        sc.watchpaths.display()
+    );
+    println!("Your peers will be woken on edits there once they run `spriff watch`.");
     Ok(())
 }
 

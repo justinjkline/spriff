@@ -56,8 +56,15 @@ pub fn run(cfg: &Config, persona: &str) -> Result<()> {
     if let Some(parent) = board_path.parent() {
         let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
     }
-    // ... plus every peer source path, recursively.
-    for p in cfg.peer_watchpaths(persona) {
+    // ... plus every peer source path, recursively. Sources come from two places:
+    // the config (`watchpaths` per agent) and each peer's live `.watchpaths`
+    // sidecar declared via `spriff touching`.
+    let mut sources = cfg.peer_watchpaths(persona);
+    for peer in cfg.peers(persona) {
+        let peer_sc = Sidecars::derive(&board_path, &peer);
+        sources.extend(crate::paths::read_watchpaths(&peer_sc.watchpaths));
+    }
+    for p in sources {
         if p.exists() {
             let _ = watcher.watch(&p, RecursiveMode::Recursive);
         }

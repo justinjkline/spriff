@@ -51,6 +51,10 @@ pub struct Sidecars {
     pub ack_log: PathBuf,
     /// Live process log.
     pub log: PathBuf,
+    /// The source paths THIS persona owns (one per line), declared live via
+    /// `spriff touching`. A peer's watcher reads this to wake on this persona's
+    /// real edits — the modern equivalent of the original `<persona>.watchpaths`.
+    pub watchpaths: PathBuf,
 }
 
 impl Sidecars {
@@ -86,6 +90,7 @@ impl Sidecars {
             state: join("watch.state"),
             ack_log: join("ack.log"),
             log: join("watch.log"),
+            watchpaths: join("watchpaths"),
         }
     }
 
@@ -107,4 +112,37 @@ impl Sidecars {
             dir.join(format!("{name}.handled.{ts}"))
         }
     }
+}
+
+/// Read a `.watchpaths` file into expanded paths. One path per line; blank lines
+/// and `#` comments are ignored. Missing file -> empty list.
+pub fn read_watchpaths(file: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| expand_tilde(Path::new(l)))
+        .collect()
+}
+
+/// Append a path to a `.watchpaths` file, de-duplicating. Creates the file if
+/// absent. Returns true if the path was newly added.
+pub fn add_watchpath(file: &Path, path: &Path) -> std::io::Result<bool> {
+    let canonical = expand_tilde(path);
+    let existing = read_watchpaths(file);
+    if existing.iter().any(|p| p == &canonical) {
+        return Ok(false);
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)?;
+    writeln!(f, "{}", canonical.display())?;
+    Ok(true)
 }
