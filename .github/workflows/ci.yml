@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: CI only needs to read the checked-out code. Denying write
+# scopes means a compromised third-party action can't use GITHUB_TOKEN to push
+# to the repo, open releases, or tamper with checks. (Public-repo hardening.)
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
