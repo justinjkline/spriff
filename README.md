@@ -87,33 +87,34 @@ cargo install --path .  # installs to ~/.cargo/bin/spriff
 
 ## Quickstart
 
-```sh
-# 1. Create a collaboration. Personas auto-assign by convention:
-#    shared first letter, executor lowest, reviewers ascending.
-spriff init checkout-refactor --agents 2
-#    → roster: Abbey (executor) · Alice (reviewer)
-
-# 2. Tell spriff which files each agent touches (so peers see their edits):
-$EDITOR ~/.spriff/checkout-refactor/checkout-refactor.toml
-
-# 3. In the repo your agents work in, drop a marker so commands need no flags:
-echo 'collab=checkout-refactor' > .spriff
-
-# 4. Onboard each agent — point it at the protocol:
-spriff skill
-
-# 5. Each agent runs the loop:
-spriff inbox                                   # what's new from my peer?
-spriff post -s "wired the seam" --status NEEDS-REVIEW -m "Alice — review the offset math."
-spriff ack                                     # mark read
-```
-
-Optionally run a watcher per agent for proactive wakeups (see
-[docs/OPERATING.md](docs/OPERATING.md)):
+There's nothing to configure. Tell each agent its role and to use spriff — it
+self-onboards with one command:
 
 ```sh
-spriff watch --collab checkout-refactor --as Abbey
+# In the implementer's session / repo:
+spriff join --role implementer
+#   → "You are Abbey — the implementer on collaboration 'default'." + the protocol.
+
+# In the reviewer's session / repo (even a different clone):
+spriff join --role reviewer
+#   → "You are Alice — the reviewer on collaboration 'default'." + the protocol.
 ```
+
+`join` creates the collaboration if needed, claims the right persona, and writes a
+`.spriff` marker so every later command needs **no flags**. Each agent then runs
+the loop:
+
+```sh
+spriff inbox          # what's new from my peer?
+spriff post -s "wired the seam" --status NEEDS-REVIEW -m "review the offset math"
+spriff ack            # mark read
+spriff wait           # block until my peer replies, then loop
+```
+
+That's the whole thing. To run several collaborations at once, name them:
+`spriff join --role implementer --collab checkout-refactor`. Optionally run a
+watcher per agent for proactive OS-level wakeups on file edits — see
+[docs/OPERATING.md](docs/OPERATING.md).
 
 ## Persona convention
 
@@ -132,7 +133,8 @@ Override anytime: `spriff init mytask --persona Nova --persona Nash`.
 
 | Command | Purpose |
 |---|---|
-| `spriff init <name> [--agents N] [--letter X] [--persona …]` | Create + register a collaboration. |
+| `spriff join --role implementer\|reviewer` | **Agent entry point.** Auto-create/join, claim persona, write marker, print protocol + first move. |
+| `spriff init <name> [--agents N] [--letter X] [--persona …]` | Create + register a collaboration explicitly. |
 | `spriff list` | List registered collaborations and rosters. |
 | `spriff skill` | Print the agent protocol (onboard any CLI agent). |
 | `spriff watch [--as P]` | Run the event-driven watcher (proactive wakeups). |

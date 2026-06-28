@@ -32,7 +32,11 @@ const SKILL: &str = include_str!("../SKILL.md");
 #[command(
     name = "spriff",
     version,
-    about = "Durable, event-driven coordination for collaborating AI agents over a shared markdown board."
+    arg_required_else_help = true,
+    about = "Durable, event-driven coordination for collaborating AI agents over a shared markdown board.",
+    long_about = "spriff coordinates a crew of AI coding agents in tight execute<->review loops \
+over a shared board.\n\nAGENTS START HERE: run `spriff join --role implementer` or \
+`spriff join --role reviewer`. That one command sets up everything and prints the protocol."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -41,6 +45,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// ⭐ Onboard yourself as an agent. Auto-creates/joins the collaboration,
+    /// claims your persona (implementer = executor, reviewer = first reviewer),
+    /// writes a repo marker so later commands need no flags, and prints the
+    /// protocol + your first move. The one command an agent runs to start.
+    Join {
+        /// Your role: implementer (executor) or reviewer.
+        #[arg(long)]
+        role: String,
+        /// Collaboration name. Default: the single registered one, else "default".
+        #[arg(long)]
+        collab: Option<String>,
+        /// Repo to mark (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Roster size if the collaboration must be created. Default 2.
+        #[arg(long, default_value_t = 2)]
+        agents: usize,
+    },
+
     /// Print the agent collaboration protocol (the SKILL file). Point any CLI
     /// agent at `spriff skill` to onboard it.
     Skill,
@@ -166,6 +189,12 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Join {
+            role,
+            collab,
+            repo,
+            agents,
+        } => cmd_join(&role, collab, repo, agents),
         Cmd::Skill => {
             print!("{SKILL}");
             Ok(())
@@ -184,7 +213,7 @@ fn main() -> Result<()> {
             as_persona,
         } => {
             let (cfg, _name) = resolve(collab, config)?;
-            let persona = as_persona.unwrap_or_else(|| cfg.default_persona());
+            let persona = resolve_persona(as_persona, &cfg);
             watcher::run(&cfg, &persona)
         }
         Cmd::Post {
@@ -197,7 +226,7 @@ fn main() -> Result<()> {
             message,
         } => {
             let (cfg, _name) = resolve(collab, config)?;
-            let persona = as_persona.unwrap_or_else(|| cfg.default_persona());
+            let persona = resolve_persona(as_persona, &cfg);
             cmd_post(&cfg, &persona, &subject, &status, &to, message)
         }
         Cmd::Inbox {
@@ -206,7 +235,7 @@ fn main() -> Result<()> {
             as_persona,
         } => {
             let (cfg, _name) = resolve(collab, config)?;
-            let persona = as_persona.unwrap_or_else(|| cfg.default_persona());
+            let persona = resolve_persona(as_persona, &cfg);
             cmd_inbox(&cfg, &persona)
         }
         Cmd::Wait {
@@ -217,7 +246,7 @@ fn main() -> Result<()> {
             interval,
         } => {
             let (cfg, _name) = resolve(collab, config)?;
-            let persona = as_persona.unwrap_or_else(|| cfg.default_persona());
+            let persona = resolve_persona(as_persona, &cfg);
             cmd_wait(&cfg, &persona, timeout, interval)
         }
         Cmd::Ack {
@@ -226,7 +255,7 @@ fn main() -> Result<()> {
             as_persona,
         } => {
             let (cfg, _name) = resolve(collab, config)?;
-            let persona = as_persona.unwrap_or_else(|| cfg.default_persona());
+            let persona = resolve_persona(as_persona, &cfg);
             let board_path = cfg.board_path();
             let sc = Sidecars::derive(&board_path, &persona);
             // Advance the consume cursor to "everything up to now" and clear the
@@ -250,7 +279,7 @@ fn main() -> Result<()> {
             as_persona,
         } => {
             let (cfg, name) = resolve(collab, config)?;
-            let persona = as_persona.unwrap_or_else(|| cfg.default_persona());
+            let persona = resolve_persona(as_persona, &cfg);
             cmd_status(&cfg, &name, &persona)
         }
         Cmd::Rollup { collab, config } => {
@@ -287,29 +316,27 @@ fn resolve(collab: Option<String>, config: Option<PathBuf>) -> Result<(Config, S
     Ok((cfg, name))
 }
 
-fn cmd_init(
-    name: &str,
-    agents: usize,
-    letter: Option<char>,
-    personas: &[String],
-    board: Option<PathBuf>,
-) -> Result<()> {
-    let dir = registry::collab_dir(name);
-    std::fs::create_dir_all(&dir)?;
-    let board_path = board.unwrap_or_else(|| registry::board_path(name));
-    board::seed_board(&board_path, name)?;
-
-    // Resolve the roster: explicit --persona names win; otherwise auto-assign by
-    // convention (shared first letter, executor lowest, reviewers ascending).
-    let roster: Vec<String> = if !personas.is_empty() {
+/// Resolve a roster: explicit `--persona` names win; otherwise auto-assign by
+/// convention (shared first letter, executor lowest, reviewers ascending).
+fn build_roster(agents: usize, letter: Option<char>, personas: &[String]) -> Vec<String> {
+    if !personas.is_empty() {
         personas.to_vec()
     } else {
         let n = agents.max(2);
         let chosen = letter.unwrap_or_else(|| names::pick_letter(&used_letters()));
         names::roster(chosen, n)
-    };
+    }
+}
 
-    // Build the config TOML by hand (we only derive Deserialize on Config).
+/// Create + register a collaboration: seed the board, write the config TOML.
+/// Idempotent enough to be safe if two agents race to create the same one (the
+/// board is only seeded if absent; the config content is deterministic).
+fn create_collab(name: &str, roster: &[String], board: Option<PathBuf>) -> Result<PathBuf> {
+    let dir = registry::collab_dir(name);
+    std::fs::create_dir_all(&dir)?;
+    let board_path = board.unwrap_or_else(|| registry::board_path(name));
+    board::seed_board(&board_path, name)?;
+
     let mut toml = String::new();
     toml.push_str(&format!("# spriff collaboration: {name}\n"));
     toml.push_str(&format!("board = \"{}\"\n\n", board_path.display()));
@@ -327,6 +354,19 @@ fn cmd_init(
 
     let cfg_path = registry::config_path(name);
     std::fs::write(&cfg_path, toml)?;
+    Ok(board_path)
+}
+
+fn cmd_init(
+    name: &str,
+    agents: usize,
+    letter: Option<char>,
+    personas: &[String],
+    board: Option<PathBuf>,
+) -> Result<()> {
+    let roster = build_roster(agents, letter, personas);
+    let board_path = create_collab(name, &roster, board)?;
+    let cfg_path = registry::config_path(name);
 
     println!("Created collaboration '{name}':");
     println!("  config: {}", cfg_path.display());
@@ -337,14 +377,126 @@ fn cmd_init(
         println!("    {persona}  ({role})");
     }
     println!();
-    println!("Next:");
+    println!("Agents can now self-onboard in any repo with:");
     println!(
-        "  1. Edit {} to add each agent's watchpaths.",
-        cfg_path.display()
+        "    spriff join --role implementer   (acts as {})",
+        roster[0]
     );
-    println!("  2. Each agent starts its watcher:  spriff watch --collab {name} --as <persona>");
-    println!("  3. In a repo, optionally:           echo 'collab={name}' > .spriff");
-    println!("  4. Onboard any CLI agent:           spriff skill");
+    if roster.len() > 1 {
+        println!(
+            "    spriff join --role reviewer      (acts as {})",
+            roster[1]
+        );
+    }
+    Ok(())
+}
+
+/// The persona to act as: `--as` flag → `$SPRIFF_AS` → `.spriff` marker `as=` →
+/// the collaboration's executor. `spriff join` writes the marker, so after
+/// joining an agent's bare commands act as the right persona automatically.
+fn resolve_persona(explicit: Option<String>, cfg: &Config) -> String {
+    if let Some(p) = explicit {
+        return p;
+    }
+    if let Ok(p) = std::env::var("SPRIFF_AS") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    if let Some(p) = registry::marker_field("as") {
+        return p;
+    }
+    cfg.default_persona()
+}
+
+/// Onboard an agent: auto-create/join the collaboration, claim the role's
+/// persona, write a repo marker so later commands need no flags, and print the
+/// protocol + first move. The single command an agent runs to start.
+fn cmd_join(
+    role: &str,
+    collab: Option<String>,
+    repo: Option<PathBuf>,
+    agents: usize,
+) -> Result<()> {
+    let role_norm = role.to_lowercase();
+    let is_impl = matches!(
+        role_norm.as_str(),
+        "implementer" | "executor" | "impl" | "exec" | "dev" | "builder"
+    );
+    let is_review = matches!(role_norm.as_str(), "reviewer" | "review" | "qa" | "critic");
+    if !is_impl && !is_review {
+        anyhow::bail!("unknown role '{role}'. Use --role implementer or --role reviewer.");
+    }
+
+    // Resolve which collaboration to join: explicit → marker/env → the single
+    // registered one → "default" (created on demand). So two agents told only
+    // their role land on the same board with zero coordination.
+    let name = collab
+        .or_else(|| {
+            std::env::var("SPRIFF_COLLAB")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| registry::marker_field("collab"))
+        .or_else(|| {
+            let l = registry::list();
+            (l.len() == 1).then(|| l[0].clone())
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    // Create it if it doesn't exist yet (first agent to join wins; idempotent).
+    if !registry::config_path(&name).exists() {
+        let roster = build_roster(agents, None, &[]);
+        create_collab(&name, &roster, None)?;
+    }
+    let cfg = Config::load(&registry::config_path(&name))?;
+
+    // Claim the role's persona: implementer = executor (index 0), reviewer =
+    // first reviewer (index 1).
+    let persona = if is_impl {
+        cfg.agents.first()
+    } else {
+        cfg.agents.get(1)
+    }
+    .map(|a| a.persona.clone())
+    .ok_or_else(|| anyhow::anyhow!("collaboration '{name}' has no slot for role '{role}'"))?;
+
+    // Write the repo marker so bare `spriff` commands here act as this persona.
+    let repo = repo
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let marker = repo.join(".spriff");
+    std::fs::write(&marker, format!("collab={name}\nas={persona}\n"))
+        .with_context(|| format!("writing marker {}", marker.display()))?;
+
+    let role_label = if is_impl { "implementer" } else { "reviewer" };
+    let peers = cfg.peers(&persona).join(", ");
+    println!("════════════════════════════════════════════════════════════════");
+    println!("  You are {persona} — the {role_label} on collaboration '{name}'.");
+    println!(
+        "  Your peer(s): {}",
+        if peers.is_empty() {
+            "(none yet)".into()
+        } else {
+            peers
+        }
+    );
+    println!("  Marker written: {}", marker.display());
+    println!("  (bare `spriff` commands in this repo now act as {persona})");
+    println!("════════════════════════════════════════════════════════════════\n");
+    print!("{SKILL}");
+    println!("\n──────────────────────────── your first move ────────────────────────────");
+    if is_impl {
+        println!("You drive implementation. Build a first coherent chunk, then:");
+        println!("    spriff post -s \"<what you did>\" --status NEEDS-REVIEW -m \"<summary + files/lines to scrutinize>\"");
+        println!("    spriff wait        # hands off and blocks until your reviewer replies");
+    } else {
+        println!("You review. Block until the implementer posts their first turn:");
+        println!("    spriff wait");
+        println!("Then read the code they reference, and:");
+        println!("    spriff post -s \"review: <area>\" --status NEEDS-REVIEW -m \"<file:line + the concrete issue>\"");
+        println!("    spriff ack");
+    }
     Ok(())
 }
 

@@ -63,10 +63,12 @@ pub fn list() -> Vec<String> {
     names
 }
 
-/// Walk up from `start` looking for a `.spriff` marker file. Its first
-/// non-empty, non-comment line (optionally `collab=<name>`) names the collab.
-fn marker_collab(start: &Path) -> Option<String> {
-    let mut dir = Some(start.to_path_buf());
+/// Walk up from the current dir looking for a `.spriff` marker, returning the
+/// value of `key` (`collab` or `as`). For `collab`, a bare line with no `=` is
+/// also accepted as the name (back-compat with the simplest marker).
+pub fn marker_field(key: &str) -> Option<String> {
+    let mut dir = std::env::current_dir().ok();
+    let prefix = format!("{key}=");
     while let Some(d) = dir {
         let marker = d.join(".spriff");
         if let Ok(text) = std::fs::read_to_string(&marker) {
@@ -75,9 +77,13 @@ fn marker_collab(start: &Path) -> Option<String> {
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                let val = line.strip_prefix("collab=").unwrap_or(line).trim();
-                if !val.is_empty() {
-                    return Some(val.to_string());
+                if let Some(v) = line.strip_prefix(&prefix) {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                } else if key == "collab" && !line.contains('=') {
+                    return Some(line.to_string());
                 }
             }
         }
@@ -96,16 +102,14 @@ pub fn resolve_name(explicit: Option<String>) -> Result<String> {
             return Ok(name);
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(name) = marker_collab(&cwd) {
-            return Ok(name);
-        }
+    if let Some(name) = marker_field("collab") {
+        return Ok(name);
     }
     let names = list();
     match names.len() {
         1 => Ok(names[0].clone()),
         0 => Err(anyhow!(
-            "no collaborations registered. Create one: spriff init <name> --me <You> --peer <Them>"
+            "no collaborations registered. Agents: run `spriff join --role implementer|reviewer`."
         )),
         _ => bail!(
             "multiple collaborations registered ({}). Pass --collab <name>, set $SPRIFF_COLLAB, \
