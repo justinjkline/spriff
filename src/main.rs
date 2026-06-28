@@ -683,6 +683,33 @@ fn heterogeneity_status(roster: &[(String, Option<String>)]) -> Heterogeneity {
     }
 }
 
+/// Structural problems in a loaded roster: a blank persona, or two agents sharing
+/// a name (which makes identity ambiguous so every command as that name is
+/// unreliable). PURE + testable. `join` now prevents these at creation, but a
+/// config written by an OLD spriff, hand-edited, or produced by another tool can
+/// still be corrupt — `doctor` surfaces it loudly instead of letting it fail
+/// silently. Each duplicate name is reported once.
+fn roster_issues(personas: &[String]) -> Vec<String> {
+    let mut issues = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, p) in personas.iter().enumerate() {
+        let t = p.trim();
+        if t.is_empty() {
+            issues.push(format!("roster slot {i} has an empty persona name"));
+            continue;
+        }
+        let key = t.to_lowercase();
+        if !seen.insert(key.clone()) && reported.insert(key) {
+            issues.push(format!(
+                "duplicate persona '{t}' on the roster — identity is ambiguous, so commands run \
+                 as '{t}' are unreliable; make every persona distinct"
+            ));
+        }
+    }
+    issues
+}
+
 /// Do a stored mission and supplied `--project` text name the SAME goal?
 /// Lenient on case and on surrounding/collapsed whitespace — those are the same
 /// goal phrased slightly differently. Strict on everything else, so two prompts
@@ -1957,6 +1984,7 @@ fn cmd_doctor(
                 );
             }
             println!("  agents:");
+            let board_bytes = board::board_size(&board);
             let mut roster_classes: Vec<(String, Option<String>)> = Vec::new();
             let mut reviewer_lenses: Vec<(String, Option<String>)> = Vec::new();
             for a in &cfg.agents {
@@ -1987,8 +2015,24 @@ fn cmd_doctor(
                     .as_deref()
                     .map(|l| format!(" · lens={l}"))
                     .unwrap_or_default();
+                // Cursor DESYNC: an offset past the live board end means a stale
+                // cursor (a pre-fix rollup or external edit) — the silent freeze
+                // that stranded a wait. Make it VISIBLE instead of letting the
+                // loop look mysteriously quiet. (It self-heals on the next
+                // inbox/wait via the read-path clamp.)
+                let desync = if st.offset > board_bytes {
+                    warnings.push(format!(
+                        "{}'s cursor is {} but the board is only {board_bytes} bytes — DESYNCED \
+                         (stale rollup/edit). Its `wait`/`inbox` will look quiet while peer turns \
+                         sit unread; it self-heals on the next `spriff inbox`/`wait --as {}`",
+                        a.persona, st.offset, a.persona
+                    ));
+                    " · ⚠CURSOR DESYNCED"
+                } else {
+                    ""
+                };
                 println!(
-                    "    {} ({role}): {unread} unread · cursor={}{serving}{class_str}{lens_str}",
+                    "    {} ({role}): {unread} unread · cursor={}{serving}{class_str}{lens_str}{desync}",
                     a.persona, st.offset
                 );
                 roster_classes.push((a.persona.clone(), class));
@@ -1996,6 +2040,14 @@ fn cmd_doctor(
                     reviewer_lenses.push((a.persona.clone(), lens));
                 }
             }
+            // Structural roster problems (duplicate / empty personas) — `join`
+            // prevents these now, but an old/hand-edited config can still be bad.
+            warnings.extend(roster_issues(
+                &cfg.agents
+                    .iter()
+                    .map(|a| a.persona.clone())
+                    .collect::<Vec<_>>(),
+            ));
             // Heterogeneity: collision is a warning; a PARTIAL declaration is
             // ALSO a warning (the check is inconclusive, not clean — Alice's
             // catch); an all-undeclared roster is just a soft nudge.
@@ -2059,6 +2111,25 @@ mod tests {
             class_path(Path::new("/x/foo.board.md"), "Abbey"),
             PathBuf::from("/x/foo.abbey.class")
         );
+    }
+
+    #[test]
+    fn roster_issues_flags_duplicates_and_empties() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Clean roster -> no issues.
+        assert!(roster_issues(&s(&["Abbey", "Alice"])).is_empty());
+        // Duplicate (case-insensitive) -> reported once, naming the persona.
+        let dup = roster_issues(&s(&["Abbey", "abbey", "Annie"]));
+        assert_eq!(dup.len(), 1);
+        assert!(
+            dup[0].to_lowercase().contains("duplicate") && dup[0].to_lowercase().contains("abbey")
+        );
+        // A triple duplicate is still a single report.
+        assert_eq!(roster_issues(&s(&["A", "A", "A"])).len(), 1);
+        // A blank slot is flagged as empty.
+        assert!(roster_issues(&s(&["Abbey", "  "]))
+            .iter()
+            .any(|m| m.contains("empty")));
     }
 
     #[test]
