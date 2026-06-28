@@ -26,6 +26,7 @@ notify = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Ergonomic error propagation across the CLI.
 anyhow = "1"
+fs2 = "0.4"
 
 [profile.release]
 # Optimize the shipped binary for size + speed — it runs 24/7 per collaboration.

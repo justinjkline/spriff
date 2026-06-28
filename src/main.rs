@@ -503,81 +503,52 @@ fn serve_lock_path(board: &std::path::Path, persona: &str) -> PathBuf {
     PathBuf::from(format!("{}serve.lock", s.trim_end_matches("watch.state")))
 }
 
-/// Is `pid` a live process? Uses `kill -0` (POSIX), no extra dependency.
-fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Singleton lock guarding one `serve` per (collab, persona). Removes the lock on
-/// drop (normal exit / panic); a hard kill leaves a stale lock, which the next
-/// acquire reclaims after checking the recorded pid is dead.
+/// Singleton lock guarding one `serve` per (collab, persona), backed by an OS
+/// advisory lock (flock via fs2). The KERNEL arbitrates exclusivity, so there is
+/// no path-based read-then-unlink TOCTOU at all, and a crashed/killed process has
+/// its lock released automatically by the OS — no stale-file reclaim needed.
+/// (Alice's fix: "an OS advisory lock held for the lifetime of `ServeLock`".)
 struct ServeLock {
-    path: PathBuf,
-    pid: u32,
-}
-impl Drop for ServeLock {
-    fn drop(&mut self) {
-        // OWNER-AWARE: only remove the lock if WE still hold it, so an older holder
-        // (e.g. one that lingered after a replacement took over) cannot delete the
-        // replacement's lock. (Alice's catch.)
-        let owned = std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            == Some(self.pid);
-        if owned {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
+    // Holding the File holds the kernel lock; dropping it releases the lock.
+    // The lock file itself is intentionally never unlinked, so every serve flocks
+    // the SAME inode (unlinking + recreating would defeat flock semantics).
+    _file: std::fs::File,
 }
 
 /// Acquire the serve singleton lock, or error if another LIVE serve holds it.
-/// This is the ironclad guard against two supervisors driving the same persona
-/// (which silently double-posts and races the cursor).
-///
-/// RACE-FREE PUBLISH (Alice's catch + fix): we write our PID to a unique temp file
-/// FIRST, then atomically publish it as the lock via `hard_link`. So the lock
-/// file, the moment it is visible to any other process, ALWAYS already contains a
-/// valid PID — there is no create-before-write window where a peer could read an
-/// empty file, mistake it for stale, and reclaim it.
 fn acquire_serve_lock(board: &std::path::Path, persona: &str) -> Result<ServeLock> {
+    use fs2::FileExt;
+    use std::io::Write;
     let path = serve_lock_path(board, persona);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let pid = std::process::id();
-    loop {
-        let tmp = path.with_extension(format!("tmp.{pid}"));
-        std::fs::write(&tmp, pid.to_string())?;
-        match std::fs::hard_link(&tmp, &path) {
-            Ok(()) => {
-                std::fs::remove_file(&tmp).ok();
-                return Ok(ServeLock { path, pid });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::fs::remove_file(&tmp).ok();
-                let held = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok());
-                match held {
-                    Some(p) if pid_alive(p) => anyhow::bail!(
-                        "another `spriff serve` is already running as {persona} (pid {p}). \
-                         Only one supervisor per persona — stop it first (kill {p})."
-                    ),
-                    // A dead PID, or a corrupt/legacy lock with no valid live PID:
-                    // reclaim and retry.
-                    _ => {
-                        std::fs::remove_file(&path).ok();
-                    }
-                }
-            }
-            Err(e) => {
-                std::fs::remove_file(&tmp).ok();
-                return Err(e.into());
-            }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false) // don't truncate on open; we set_len(0) only after locking
+        .open(&path)
+        .with_context(|| format!("opening serve lock {}", path.display()))?;
+
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            // We hold the kernel lock. Record our pid as DIAGNOSTIC text only —
+            // ownership is decided by the kernel lock, never by this content.
+            file.set_len(0).ok();
+            let _ = (&file).write_all(std::process::id().to_string().as_bytes());
+            Ok(ServeLock { _file: file })
+        }
+        Err(_) => {
+            let pid = std::fs::read_to_string(&path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "?".into());
+            anyhow::bail!(
+                "another `spriff serve` is already running as {persona} (pid {pid}). \
+                 Only one supervisor per persona — stop it first."
+            )
         }
     }
 }
@@ -1335,49 +1306,36 @@ mod tests {
     }
 
     #[test]
-    fn serve_lock_is_exclusive_then_reclaimable() {
+    fn serve_lock_is_exclusive_then_releasable() {
         let dir = std::env::temp_dir().join(format!("spriff-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let board = dir.join("t.board.md");
         std::fs::write(&board, "x").unwrap();
 
         let lock = acquire_serve_lock(&board, "Alice").unwrap();
-        // A second acquire while the first is held (our own live pid) must fail.
+        // A second acquire while the kernel lock is held must fail.
         assert!(acquire_serve_lock(&board, "Alice").is_err());
-        drop(lock); // release
+        drop(lock); // releases the OS lock
                     // After release, acquiring again succeeds.
         assert!(acquire_serve_lock(&board, "Alice").is_ok());
-
-        // A stale lock (dead pid) is reclaimed.
-        let p = serve_lock_path(&board, "Bob");
-        std::fs::write(&p, "999999999").unwrap(); // not a live pid
-        assert!(acquire_serve_lock(&board, "Bob").is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn serve_lock_reclaims_corrupt_and_drop_is_owner_aware() {
+    fn serve_lock_acquirable_when_file_exists_but_unlocked() {
+        // Simulates a crashed/killed serve: the lock FILE persists with a stale
+        // pid, but no process holds the kernel lock — so a fresh serve acquires it
+        // with no path-based reclaim (the OS released the dead process's lock).
         let dir = std::env::temp_dir().join(format!("spriff-lock2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let board = dir.join("t.board.md");
         std::fs::write(&board, "x").unwrap();
 
-        // An empty/corrupt lock (no valid PID) is reclaimed, not treated as a live
-        // holder — this is the race fallback Alice asked us to cover.
-        let p = serve_lock_path(&board, "Cara");
+        let p = serve_lock_path(&board, "Bob");
         std::fs::create_dir_all(p.parent().unwrap()).ok();
-        std::fs::write(&p, "").unwrap();
-        let lock = acquire_serve_lock(&board, "Cara").expect("empty lock must be reclaimable");
-
-        // Owner-aware Drop: if the lock now records a DIFFERENT pid (a replacement
-        // took over), our Drop must NOT delete it.
-        std::fs::write(&p, "424242").unwrap();
-        drop(lock);
-        assert!(
-            p.exists(),
-            "owner-aware Drop must not delete a lock it no longer owns"
-        );
+        std::fs::write(&p, "999999").unwrap(); // leftover file, nobody flocking it
+        assert!(acquire_serve_lock(&board, "Bob").is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
     }
