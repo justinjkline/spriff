@@ -43,6 +43,12 @@ pub struct Agent {
     /// live `spriff join --class <x>` sidecar takes precedence over this seed.
     #[serde(default)]
     pub class: Option<String>,
+    /// Review lens for a reviewer in a multi-reviewer crew (e.g. "correctness",
+    /// "security", "regressions"). Distinct lenses make extra reviewers add
+    /// *diversity* instead of redundancy. A live `spriff join --lens <x>` sidecar
+    /// takes precedence over this seed.
+    #[serde(default)]
+    pub lens: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -79,6 +79,11 @@ enum Cmd {
         /// of the error-decorrelation gain that makes a heterogeneous crew win.
         #[arg(long)]
         class: Option<String>,
+        /// Your review lens (e.g. correctness, security, regressions) when you're a
+        /// reviewer in a 2+ reviewer crew. Distinct lenses make extra reviewers add
+        /// diversity, not redundancy; spriff focuses your wake prompt on it.
+        #[arg(long)]
+        lens: Option<String>,
         /// Repo to mark (defaults to the current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -299,9 +304,12 @@ fn main() -> Result<()> {
             project,
             collab,
             class,
+            lens,
             repo,
             agents,
-        } => cmd_join(&role, as_name, with, project, collab, class, repo, agents),
+        } => cmd_join(
+            &role, as_name, with, project, collab, class, lens, repo, agents,
+        ),
         Cmd::Whoami {
             collab,
             config,
@@ -552,6 +560,70 @@ fn resolve_class(cfg: &Config, board: &std::path::Path, persona: &str) -> Option
         .and_then(|a| a.class.clone())
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
+}
+
+/// The per-persona review-lens sidecar: `<base>.<persona>.lens` (same pattern as
+/// the class sidecar, written by `join --lens`).
+fn lens_path(board: &std::path::Path, persona: &str) -> PathBuf {
+    let state = Sidecars::derive(board, persona).state;
+    let s = state.to_string_lossy();
+    PathBuf::from(format!("{}lens", s.trim_end_matches("watch.state")))
+}
+
+/// A reviewer's declared review lens: the live `join --lens` sidecar if present,
+/// else the seed `lens` field in the config roster, else None.
+fn resolve_lens(cfg: &Config, board: &std::path::Path, persona: &str) -> Option<String> {
+    if let Ok(t) = std::fs::read_to_string(lens_path(board, persona)) {
+        let t = t.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    cfg.agents
+        .iter()
+        .find(|a| a.persona.eq_ignore_ascii_case(persona))
+        .and_then(|a| a.lens.clone())
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+}
+
+/// Advise on review-lens coverage across a crew's REVIEWERS. PURE + testable.
+/// Lenses only matter once there are 2+ reviewers — then distinct lenses make
+/// the extra reviewer add diversity rather than redundancy (a redundant reviewer
+/// is the "more agents, worse" failure mode). `reviewers` is (persona, lens).
+/// Returns a warning on a shared lens, a nudge if lenses are missing, else None.
+fn lens_advisory(reviewers: &[(String, Option<String>)]) -> Option<String> {
+    if reviewers.len() < 2 {
+        return None; // one reviewer: nothing to diversify.
+    }
+    let norm = |l: &Option<String>| {
+        l.as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+    };
+    for i in 0..reviewers.len() {
+        for j in (i + 1)..reviewers.len() {
+            if let (Some(a), Some(b)) = (norm(&reviewers[i].1), norm(&reviewers[j].1)) {
+                if a == b {
+                    return Some(format!(
+                        "{} and {} share review lens '{a}': redundant — give each reviewer a \
+                         DISTINCT lens (e.g. correctness / security / regressions) so extra \
+                         reviewers add diversity, not duplicate coverage",
+                        reviewers[i].0, reviewers[j].0
+                    ));
+                }
+            }
+        }
+    }
+    if reviewers.iter().any(|(_, l)| norm(l).is_none()) {
+        return Some(
+            "2+ reviewers without distinct lenses — assign each a lens \
+             (`spriff join --role reviewer --lens <correctness|security|regressions|…>`) so \
+             they cover different failure modes instead of overlapping"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// The outcome of the model-class heterogeneity check over a roster.
@@ -940,6 +1012,31 @@ fn slugify(s: &str) -> String {
     }
 }
 
+/// Which roster slot a joining agent claims. PURE + testable. A reviewer is NOT
+/// necessarily slot 1: in a 3+ crew, a reviewer who names itself with `--as` binds
+/// to THAT reviewer's slot so the 2nd, 3rd, … reviewer can actually join. The
+/// executor slot (0) is never a valid reviewer target, so an `--as` that resolves
+/// to slot 0 falls back to the default and the caller's validation rejects it.
+/// (Alice's catch: join hardcoded reviewer → slot 1, so a second reviewer's
+/// `--as Annie` failed against slot 1 = Alice.)
+fn resolve_my_slot(
+    is_review: bool,
+    as_name: Option<&str>,
+    default_slot: usize,
+    roster: &[String],
+) -> usize {
+    if is_review {
+        if let Some(idx) =
+            as_name.and_then(|n| roster.iter().position(|p| p.eq_ignore_ascii_case(n)))
+        {
+            if idx != 0 {
+                return idx;
+            }
+        }
+    }
+    default_slot
+}
+
 /// The board to join when the agent gave no explicit signal: the single
 /// registered collaboration, or "default" if none — but if SEVERAL exist, refuse
 /// to guess (which would silently join the wrong board) and ask for disambiguation.
@@ -968,6 +1065,7 @@ fn cmd_join(
     project: Option<String>,
     collab: Option<String>,
     class: Option<String>,
+    lens: Option<String>,
     repo: Option<PathBuf>,
     agents: usize,
 ) -> Result<()> {
@@ -979,6 +1077,15 @@ fn cmd_join(
     let is_review = matches!(role_norm.as_str(), "reviewer" | "review" | "qa" | "critic");
     if !is_impl && !is_review {
         anyhow::bail!("unknown role '{role}'. Use --role implementer or --role reviewer.");
+    }
+    // A review lens is meaningless for the implementer — reject it loudly rather
+    // than silently writing a lens an implementer would then carry into serve/status
+    // surfaces. (Alice's catch: --lens leaked onto non-reviewers.)
+    if lens.is_some() && !is_review {
+        anyhow::bail!(
+            "--lens is for reviewers only — role '{role}' is the implementer, and a review lens \
+             has no meaning for the agent doing the building."
+        );
     }
 
     // Resolve which board to join, in priority order:
@@ -1033,11 +1140,49 @@ fn cmd_join(
         let created = !registry::config_path(&name).exists();
         if created {
             let mut roster = build_roster(agents.max(2), None, &[]);
-            if let Some(n) = &as_name {
-                roster[my_slot] = n.clone();
-            }
+            // Apply --with FIRST: it can rename the peer/executor slot, and the
+            // role-conflict check below must see the post-with executor name.
             if let Some(n) = &with {
                 roster[peer_slot] = n.clone();
+            }
+            // A reviewer whose --as names the executor slot (slot 0) is a ROLE
+            // CONFLICT — a reviewer can't be the implementer. Without this, --as
+            // matching slot 0 fell back to slot 1 and then OVERWROTE the first
+            // reviewer with the executor's name (`Abbey, Abbey, Annie`), and
+            // validation passed because slot 1 was now also that name. (Alice.)
+            if is_review {
+                if let Some(n) = &as_name {
+                    if roster
+                        .first()
+                        .map(|e| e.eq_ignore_ascii_case(n))
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "--as {n} is the implementer on a new '{name}' crew but --role is \
+                             reviewer — a reviewer can't claim the implementer's slot. Use a \
+                             reviewer name, or pass --with <implementer> to name the implementer."
+                        );
+                    }
+                }
+            }
+            // Resolve MY slot against the GENERATED roster so a reviewer that
+            // CREATES the board (reviewer #2 winning the create race) lands in its
+            // own slot instead of clobbering the first reviewer. (Alice's catch.)
+            let create_slot = resolve_my_slot(is_review, as_name.as_deref(), my_slot, &roster);
+            if let Some(n) = &as_name {
+                roster[create_slot] = n.clone();
+            }
+            // Final roster personas MUST be distinct — a duplicate makes identity
+            // ambiguous and silently passes --as validation. (Alice's catch.)
+            let mut seen = std::collections::HashSet::new();
+            for p in &roster {
+                if !seen.insert(p.to_lowercase()) {
+                    anyhow::bail!(
+                        "creating '{name}' would put two agents named '{p}' on the roster ({}). \
+                         Personas must be distinct — check --as/--with.",
+                        roster.join(", ")
+                    );
+                }
             }
             create_collab(&name, &roster, None)?;
         }
@@ -1054,6 +1199,12 @@ fn cmd_join(
         }
         Ok((cfg, created))
     })?;
+
+    // Re-resolve MY slot now that the roster is known: a reviewer that named
+    // itself with --as binds to that reviewer's slot, so the 2nd+ reviewer in a 3+
+    // crew can join (not just slot 1). (Alice's catch.)
+    let roster_personas: Vec<String> = cfg.agents.iter().map(|a| a.persona.clone()).collect();
+    let my_slot = resolve_my_slot(is_review, as_name.as_deref(), my_slot, &roster_personas);
 
     // The canonical persona for my role IS the roster slot. Identity must stay
     // canonical or every downstream invariant (peers, sidecars, addressees, turn
@@ -1101,6 +1252,16 @@ fn cmd_join(
             let p = class_path(&cfg.board_path(), &persona);
             std::fs::write(&p, format!("{c}\n"))
                 .with_context(|| format!("writing class sidecar {}", p.display()))?;
+        }
+    }
+    // Record this reviewer's review lens (sidecar) so `serve` can focus its wake
+    // prompt on it and `doctor` can flag two reviewers covering the same lens.
+    if let Some(l) = &lens {
+        let l = l.trim();
+        if !l.is_empty() {
+            let p = lens_path(&cfg.board_path(), &persona);
+            std::fs::write(&p, format!("{l}\n"))
+                .with_context(|| format!("writing lens sidecar {}", p.display()))?;
         }
     }
 
@@ -1176,6 +1337,11 @@ fn cmd_join(
         println!(
             "You are the REVIEWER. This loop IS your whole job — repeat it until the work is DONE:"
         );
+        if let Some(l) = resolve_lens(&cfg, &cfg.board_path(), &persona) {
+            println!(
+                "  (Your review lens: {l} — concentrate your scrutiny there; peers cover other angles.)"
+            );
+        }
         println!("  1. spriff wait --as {me}      ← BLOCKS cheaply until the implementer posts");
         println!("  2. Try to BREAK it: read the diff against the goal, run the tests + linters,");
         println!("     hunt the failing case. Skeptical by default — don't bless it.");
@@ -1450,6 +1616,13 @@ fn cmd_serve(
     let interval = Duration::from_secs(poll.max(1));
     const MAX_ATTEMPTS: u32 = 3;
     let mission = read_mission(&cfg.board_path());
+    // A reviewer's declared lens (if any) focuses its supervised wake prompt — and
+    // ONLY a reviewer's: an implementer must never get review-lens prompt text.
+    let lens = if cfg.role_of(persona).as_deref() == Some("reviewer") {
+        resolve_lens(cfg, &cfg.board_path(), persona)
+    } else {
+        None
+    };
     eprintln!(
         "[spriff] serving {persona} on '{name}': invoking `{}` per peer turn (poll {poll}s, idle_timeout {idle_timeout}s){}",
         agent_cmd.join(" "),
@@ -1465,7 +1638,7 @@ fn cmd_serve(
             name,
             persona,
             config.as_deref(),
-            &kickoff_prompt(name, persona, mission.as_deref()),
+            &kickoff_prompt(name, persona, mission.as_deref(), lens.as_deref()),
         );
     }
 
@@ -1508,7 +1681,13 @@ fn cmd_serve(
             name,
             persona,
             config.as_deref(),
-            &wake_prompt(name, persona, turns.len(), mission.as_deref()),
+            &wake_prompt(
+                name,
+                persona,
+                turns.len(),
+                mission.as_deref(),
+                lens.as_deref(),
+            ),
         );
 
         // COMPLETION POLICY (not "did the process exit 0"): did the turn actually
@@ -1591,7 +1770,27 @@ fn completion_clause(mission: Option<&str>) -> String {
     )
 }
 
-fn wake_prompt(name: &str, persona: &str, n: usize, mission: Option<&str>) -> String {
+/// Focus clause appended to a reviewer's supervisor prompt when it has a declared
+/// review lens, so a multi-reviewer crew covers distinct failure modes rather than
+/// overlapping (the "more agents only help if diverse" lesson).
+fn lens_clause(lens: Option<&str>) -> String {
+    match lens {
+        Some(l) if !l.trim().is_empty() => format!(
+            " YOUR REVIEW LENS is '{}': concentrate your scrutiny there — other reviewers cover \
+             other angles, so depth on your lens beats shallow breadth.",
+            l.trim()
+        ),
+        _ => String::new(),
+    }
+}
+
+fn wake_prompt(
+    name: &str,
+    persona: &str,
+    n: usize,
+    mission: Option<&str>,
+    lens: Option<&str>,
+) -> String {
     format!(
         "You are {persona}, an agent on the spriff collaboration '{name}'. {n} new peer \
          turn(s) are waiting. Do exactly ONE turn, then EXIT — do NOT run `spriff wait` or \
@@ -1599,19 +1798,21 @@ fn wake_prompt(name: &str, persona: &str, n: usize, mission: Option<&str>) -> St
          posts, so idling only wastes tokens (any 'stay in the loop / spriff wait' note from \
          `spriff skill` does NOT apply while supervised). The turn: run `spriff inbox` to read \
          the new turn(s), do the work, post your reply with `spriff post -s \"...\" --status \
-         <STATUS>` (body via a quoted heredoc, never -m \"...\"), then `spriff ack`.{}",
-        completion_clause(mission)
+         <STATUS>` (body via a quoted heredoc, never -m \"...\"), then `spriff ack`.{}{}",
+        completion_clause(mission),
+        lens_clause(lens),
     )
 }
 
-fn kickoff_prompt(name: &str, persona: &str, mission: Option<&str>) -> String {
+fn kickoff_prompt(name: &str, persona: &str, mission: Option<&str>, lens: Option<&str>) -> String {
     format!(
         "You are {persona}, an agent on the spriff collaboration '{name}'. Assess with `spriff \
          status` and `spriff inbox`. If a peer turn is waiting, handle it (read, work, `spriff \
          post`, `spriff ack`). If you are the implementer and nothing is waiting, make the \
          opening move (post your intro/plan). Do exactly ONE turn, then EXIT — do NOT run \
-         `spriff wait`; the supervisor re-invokes you when your peer posts.{}",
-        completion_clause(mission)
+         `spriff wait`; the supervisor re-invokes you when your peer posts.{}{}",
+        completion_clause(mission),
+        lens_clause(lens),
     )
 }
 
@@ -1630,6 +1831,12 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
     }
     if let Some(c) = resolve_class(cfg, &board_path, persona) {
         println!("  class:      {c}");
+    }
+    // A lens is a reviewer-only concept — never surface one for the implementer.
+    if cfg.role_of(persona).as_deref() == Some("reviewer") {
+        if let Some(l) = resolve_lens(cfg, &board_path, persona) {
+            println!("  lens:       {l}");
+        }
     }
     println!("  board:      {} ({} bytes)", board_path.display(), size);
     println!("  cursor:     offset={}", st.offset);
@@ -1751,6 +1958,7 @@ fn cmd_doctor(
             }
             println!("  agents:");
             let mut roster_classes: Vec<(String, Option<String>)> = Vec::new();
+            let mut reviewer_lenses: Vec<(String, Option<String>)> = Vec::new();
             for a in &cfg.agents {
                 let sc = Sidecars::derive(&board, &a.persona);
                 let st = state::WatchState::load(&sc.state);
@@ -1768,11 +1976,25 @@ fn cmd_doctor(
                     .as_deref()
                     .map(|c| format!(" · class={c}"))
                     .unwrap_or_default();
+                let is_reviewer = role.eq_ignore_ascii_case("reviewer");
+                // Lens is a reviewer-only concept — only resolve/show it for reviewers.
+                let lens = if is_reviewer {
+                    resolve_lens(&cfg, &board, &a.persona)
+                } else {
+                    None
+                };
+                let lens_str = lens
+                    .as_deref()
+                    .map(|l| format!(" · lens={l}"))
+                    .unwrap_or_default();
                 println!(
-                    "    {} ({role}): {unread} unread · cursor={}{serving}{class_str}",
+                    "    {} ({role}): {unread} unread · cursor={}{serving}{class_str}{lens_str}",
                     a.persona, st.offset
                 );
                 roster_classes.push((a.persona.clone(), class));
+                if is_reviewer {
+                    reviewer_lenses.push((a.persona.clone(), lens));
+                }
             }
             // Heterogeneity: collision is a warning; a PARTIAL declaration is
             // ALSO a warning (the check is inconclusive, not clean — Alice's
@@ -1791,6 +2013,11 @@ fn cmd_doctor(
                      --class <claude|gpt|…>` lets spriff flag a same-class pairing"
                 ),
                 Heterogeneity::Healthy => {}
+            }
+            // Review lenses: only relevant with 2+ reviewers — flag a shared lens
+            // (redundant coverage) or missing lenses (overlap risk).
+            if let Some(adv) = lens_advisory(&reviewer_lenses) {
+                warnings.push(adv);
             }
         }
     }
@@ -1906,10 +2133,48 @@ mod tests {
 
     #[test]
     fn wake_prompt_tells_supervised_agent_to_exit_not_wait() {
-        let p = wake_prompt("demo", "Alice", 1, None);
+        let p = wake_prompt("demo", "Alice", 1, None, None);
         assert!(p.contains("EXIT"));
         assert!(p.contains("do NOT run `spriff wait`"));
         assert!(p.contains("spriff ack"));
+    }
+
+    #[test]
+    fn wake_prompt_focuses_a_reviewer_on_its_lens() {
+        // No lens -> no lens clause; a lens -> the supervised reviewer is told to
+        // concentrate there (so a multi-reviewer crew covers distinct angles).
+        assert!(!wake_prompt("demo", "Alice", 1, None, None).contains("REVIEW LENS"));
+        let p = wake_prompt("demo", "Alice", 1, None, Some("security"));
+        assert!(p.contains("REVIEW LENS is 'security'"));
+        // Blank lens is treated as none.
+        assert!(!wake_prompt("demo", "Alice", 1, None, Some("  ")).contains("REVIEW LENS"));
+    }
+
+    #[test]
+    fn lens_advisory_only_fires_for_multi_reviewer_crews() {
+        let rev = |a: &str, la: Option<&str>, b: &str, lb: Option<&str>| {
+            vec![
+                (a.to_string(), la.map(str::to_string)),
+                (b.to_string(), lb.map(str::to_string)),
+            ]
+        };
+        // Fewer than two reviewers -> never advise.
+        assert!(lens_advisory(&[("Alice".to_string(), None)]).is_none());
+        assert!(lens_advisory(&[("Alice".to_string(), Some("security".to_string()))]).is_none());
+        // Two reviewers, distinct lenses -> healthy.
+        assert!(lens_advisory(&rev(
+            "Alice",
+            Some("security"),
+            "Annie",
+            Some("correctness")
+        ))
+        .is_none());
+        // Same lens (case/space-insensitive) -> warn naming both + the lens.
+        let w = lens_advisory(&rev("Alice", Some("Security"), "Annie", Some(" security ")))
+            .expect("shared lens must warn");
+        assert!(w.contains("Alice") && w.contains("Annie") && w.contains("security"));
+        // A missing lens among 2+ reviewers -> nudge to assign distinct lenses.
+        assert!(lens_advisory(&rev("Alice", Some("security"), "Annie", None)).is_some());
     }
 
     #[test]
@@ -1952,6 +2217,27 @@ mod tests {
         assert_eq!(slugify("My Project"), slugify("my   project"));
         // Never empty.
         assert_eq!(slugify("***"), "project");
+    }
+
+    #[test]
+    fn resolve_my_slot_binds_reviewer_to_its_named_slot() {
+        let roster = vec![
+            "Abbey".to_string(),
+            "Alice".to_string(),
+            "Annie".to_string(),
+        ];
+        // Implementer keeps slot 0.
+        assert_eq!(resolve_my_slot(false, Some("Abbey"), 0, &roster), 0);
+        // The bug fix: a reviewer naming the SECOND reviewer binds to slot 2.
+        assert_eq!(resolve_my_slot(true, Some("Annie"), 1, &roster), 2);
+        // First reviewer -> slot 1; case-insensitive.
+        assert_eq!(resolve_my_slot(true, Some("alice"), 1, &roster), 1);
+        // No --as -> default first-reviewer slot.
+        assert_eq!(resolve_my_slot(true, None, 1, &roster), 1);
+        // A reviewer naming the executor (slot 0) falls back to default so the
+        // caller's cross-role validation rejects it; an unknown name does too.
+        assert_eq!(resolve_my_slot(true, Some("Abbey"), 1, &roster), 1);
+        assert_eq!(resolve_my_slot(true, Some("Zed"), 1, &roster), 1);
     }
 
     #[test]

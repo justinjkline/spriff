@@ -408,3 +408,255 @@ fn concurrent_same_project_joins_converge_on_one_board() {
         stdout(&o2)
     );
 }
+
+// ---------------------------------------------------------------------------
+// 7. --lens is reviewer-only: an implementer that passes it is rejected loudly.
+// ---------------------------------------------------------------------------
+#[test]
+fn lens_is_rejected_for_the_implementer() {
+    let sb = Sandbox::new("lensimpl");
+    let a = sb.cwd("impl");
+    let o = sb.run(
+        &a,
+        &[
+            "join",
+            "--role",
+            "implementer",
+            "--project",
+            "demo",
+            "--lens",
+            "security",
+        ],
+    );
+    assert!(!o.status.success(), "implementer --lens must be rejected");
+    assert!(
+        stderr(&o).contains("--lens is for reviewers only"),
+        "error should explain the lens is reviewer-only:\n{}",
+        stderr(&o)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. The SECOND reviewer in a 3-agent crew can join via --as and declare a lens
+//    (Alice's catch: join used to hardcode any reviewer to roster slot 1).
+// ---------------------------------------------------------------------------
+#[test]
+fn second_reviewer_can_join_and_declare_a_lens() {
+    let sb = Sandbox::new("tworev");
+    let (a, b, c) = (sb.cwd("impl"), sb.cwd("rev1"), sb.cwd("rev2"));
+
+    // Implementer creates a 3-agent crew: Abbey (exec), Alice + Annie (reviewers).
+    assert!(sb
+        .run(
+            &a,
+            &[
+                "join",
+                "--role",
+                "implementer",
+                "--as",
+                "Abbey",
+                "--with",
+                "Alice",
+                "--project",
+                "trio",
+                "--agents",
+                "3"
+            ],
+        )
+        .status
+        .success());
+
+    // First reviewer joins slot 1.
+    let r1 = sb.run(
+        &b,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Alice",
+            "--with",
+            "Abbey",
+            "--project",
+            "trio",
+            "--lens",
+            "security",
+        ],
+    );
+    assert!(
+        r1.status.success(),
+        "first reviewer join failed: {}",
+        stderr(&r1)
+    );
+
+    // SECOND reviewer (slot 2) must now be able to join and declare its lens.
+    let r2 = sb.run(
+        &c,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Annie",
+            "--with",
+            "Abbey",
+            "--project",
+            "trio",
+            "--lens",
+            "correctness",
+        ],
+    );
+    assert!(
+        r2.status.success(),
+        "second reviewer join failed: {}",
+        stderr(&r2)
+    );
+    assert!(
+        marker(&c).contains("as=Annie"),
+        "rev2 marker should be Annie: {}",
+        marker(&c)
+    );
+
+    // Each reviewer's declared lens is visible via status; the two are distinct.
+    assert!(stdout(&sb.run(&b, &["status", "--as", "Alice"])).contains("security"));
+    assert!(stdout(&sb.run(&c, &["status", "--as", "Annie"])).contains("correctness"));
+}
+
+// ---------------------------------------------------------------------------
+// 9. Reviewer #2 may CREATE the crew first (win the create race) without
+//    corrupting the generated roster. (Alice's catch: the slot fix must apply at
+//    creation too, else `--as Annie` overwrote slot 1 → Abbey, Annie, Annie.)
+// ---------------------------------------------------------------------------
+#[test]
+fn second_reviewer_can_create_the_crew_first() {
+    let sb = Sandbox::new("revfirst");
+    let c = sb.cwd("rev2");
+    let o = sb.run(
+        &c,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Annie",
+            "--with",
+            "Abbey",
+            "--project",
+            "rev first trio",
+            "--agents",
+            "3",
+            "--lens",
+            "correctness",
+        ],
+    );
+    assert!(
+        o.status.success(),
+        "reviewer-first create failed: {}",
+        stderr(&o)
+    );
+    assert!(
+        marker(&c).contains("as=Annie"),
+        "rev2 marker: {}",
+        marker(&c)
+    );
+
+    // The generated roster must stay intact: exactly one each of Abbey/Alice/Annie.
+    let cfg = std::fs::read_to_string(sb.root.join("rev-first-trio").join("rev-first-trio.toml"))
+        .expect("config written");
+    assert_eq!(
+        cfg.matches("persona = \"Abbey\"").count(),
+        1,
+        "roster: {cfg}"
+    );
+    assert_eq!(
+        cfg.matches("persona = \"Alice\"").count(),
+        1,
+        "Alice dropped: {cfg}"
+    );
+    assert_eq!(
+        cfg.matches("persona = \"Annie\"").count(),
+        1,
+        "Annie duplicated: {cfg}"
+    );
+    // Annie's lens still landed.
+    assert!(stdout(&sb.run(&c, &["status", "--as", "Annie"])).contains("correctness"));
+}
+
+// ---------------------------------------------------------------------------
+// 10. A reviewer naming the GENERATED EXECUTOR (no --with) is a role conflict —
+//     rejected, with NO corrupt board created. (Alice's catch: it used to fall
+//     back to slot 1 and overwrite the first reviewer → Abbey, Abbey, Annie.)
+// ---------------------------------------------------------------------------
+#[test]
+fn reviewer_naming_the_generated_executor_is_rejected() {
+    let sb = Sandbox::new("execconflict");
+    let a = sb.cwd("rev");
+    let o = sb.run(
+        &a,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Abbey",
+            "--project",
+            "bad exec",
+            "--agents",
+            "3",
+            "--lens",
+            "security",
+        ],
+    );
+    assert!(!o.status.success(), "reviewer-as-executor must be rejected");
+    assert!(
+        stderr(&o).contains("implementer"),
+        "error should explain the role conflict:\n{}",
+        stderr(&o)
+    );
+    assert!(
+        sb.slugs().is_empty(),
+        "a rejected join must not create a board: {:?}",
+        sb.slugs()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. A reviewer MAY rename the implementer via --with (Alice's note that this
+//     variant is legitimate): `--as Abbey --with Alice` → Alice executor, Abbey
+//     reviewer, no duplicates.
+// ---------------------------------------------------------------------------
+#[test]
+fn reviewer_may_rename_the_implementer_via_with() {
+    let sb = Sandbox::new("withrename");
+    let a = sb.cwd("rev");
+    let o = sb.run(
+        &a,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Abbey",
+            "--with",
+            "Alice",
+            "--project",
+            "with rename",
+            "--agents",
+            "3",
+            "--lens",
+            "security",
+        ],
+    );
+    assert!(
+        o.status.success(),
+        "valid --with rename failed: {}",
+        stderr(&o)
+    );
+    assert!(marker(&a).contains("as=Abbey"), "marker: {}", marker(&a));
+    let cfg = std::fs::read_to_string(sb.root.join("with-rename").join("with-rename.toml"))
+        .expect("config written");
+    // One each — no duplicate from the rename.
+    assert_eq!(cfg.matches("persona = \"Alice\"").count(), 1, "{cfg}");
+    assert_eq!(cfg.matches("persona = \"Abbey\"").count(), 1, "{cfg}");
+    assert_eq!(cfg.matches("persona = \"Annie\"").count(), 1, "{cfg}");
+}
