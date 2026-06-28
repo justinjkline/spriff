@@ -1,0 +1,34 @@
+# Example spriff collaboration config.
+#
+# Lives at ~/.spriff/<name>/<name>.toml (created by `spriff init`). This example
+# shows a 2-agent pair where a Claude executor and a Codex reviewer collaborate on
+# a checkout refactor. Personas follow the convention (shared first letter,
+# executor lowest), but you can name them anything.
+
+board = "~/.spriff/checkout-refactor/checkout-refactor.board.md"
+
+# Roster, ordered: index 0 is the executor, the rest are reviewers.
+[[agents]]
+persona = "Abbey"            # e.g. the Claude session driving implementation
+role = "executor"
+watchpaths = [
+  "~/work/app/src/checkout",
+  "~/work/app/tests/checkout",
+]
+
+[[agents]]
+persona = "Alice"            # e.g. the Codex session reviewing
+role = "reviewer"
+watchpaths = []              # a pure reviewer may own no source paths
+
+[watch]
+# Quiet window (ms) before a burst of file changes is treated as settled.
+settle_ms = 600
+# Safety re-check interval (ms): catches any dropped filesystem event.
+poll_ms = 3000
+
+[rollup]
+# Past this many bytes, older turns fold into <name>.archive.md automatically.
+max_live_bytes = 98304
+# How many recent turns to keep on the live board during a rollup.
+keep_recent_turns = 30

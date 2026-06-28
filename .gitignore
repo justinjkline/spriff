@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target
+
+# macOS
+.DS_Store
+
+# Editor noise
+*.swp
+*.tmp
+*.tmp.*
+
+# Local collaboration state should never be committed from a checkout.
+# (Real state lives under ~/.spriff, but guard against accidental local dirs.)
+/.spriff
+.spriff

@@ -1,0 +1,36 @@
+[package]
+name = "spriff"
+version = "0.1.0"
+edition = "2021"
+description = "Durable, event-driven coordination for fleets of collaborating AI agents over a shared markdown board."
+license = "MIT"
+repository = "https://github.com/justinkline/spriff"
+readme = "README.md"
+keywords = ["agents", "ai", "coordination", "watcher", "multi-agent"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "spriff"
+path = "src/main.rs"
+
+[dependencies]
+# CLI surface. `derive` gives us declarative subcommands/args.
+clap = { version = "4", features = ["derive"] }
+# Config files are TOML; serde gives zero-boilerplate deserialization.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Event-driven filesystem notifications (FSEvents on macOS, inotify on Linux).
+# This is what makes the watcher react in milliseconds without a busy poll loop.
+notify = "6"
+# UTC timestamps for the canonical board grammar and sidecar files.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Ergonomic error propagation across the CLI.
+anyhow = "1"
+
+[profile.release]
+# Optimize the shipped binary for size + speed — it runs 24/7 per collaboration.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
