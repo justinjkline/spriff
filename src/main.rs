@@ -554,18 +554,40 @@ fn resolve_class(cfg: &Config, board: &std::path::Path, persona: &str) -> Option
         .filter(|c| !c.is_empty())
 }
 
-/// Warn when two agents share a model class. PURE + testable. A same-class
-/// implementer/reviewer pair forfeits most of the error-decorrelation gain that
-/// makes a heterogeneous crew beat a single model — the reviewer's mistakes are
-/// correlated with the implementer's, so it catches less. Returns the FIRST
-/// colliding pair in roster order (deterministic). `roster` is (persona, class).
-fn heterogeneity_advisory(roster: &[(String, Option<String>)]) -> Option<String> {
+/// The outcome of the model-class heterogeneity check over a roster.
+#[derive(Debug, PartialEq, Eq)]
+enum Heterogeneity {
+    /// Two agents share a model class — the actionable problem (carries the message).
+    Collision(String),
+    /// Some agents declared a class and some didn't — the check is INCONCLUSIVE,
+    /// NOT clean (carries the personas missing a class). A single unknown in a
+    /// two-agent crew leaves the same-class risk unassessed. (Alice's catch.)
+    Unverified(Vec<String>),
+    /// No classes declared at all — the feature simply isn't in use (a soft nudge,
+    /// not a warning, so `doctor` stays quiet for crews that don't use classes).
+    Undeclared,
+    /// Every agent declared a class and all are distinct — verified heterogeneous.
+    Healthy,
+}
+
+/// Classify a roster's model-class diversity. PURE + testable. The premise
+/// (Condorcet independence; the ambiguity decomposition) is that the gain comes
+/// from DECORRELATED errors, which decorrelate most across different model
+/// classes — so a same-class implementer/reviewer pair forfeits most of it, and a
+/// *partially* declared roster can't be certified clean. `roster` is
+/// (persona, class); the collision message names the first colliding pair in
+/// roster order (deterministic).
+fn heterogeneity_status(roster: &[(String, Option<String>)]) -> Heterogeneity {
+    let norm = |c: &Option<String>| {
+        c.as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+    };
     for i in 0..roster.len() {
         for j in (i + 1)..roster.len() {
-            if let (Some(ca), Some(cb)) = (&roster[i].1, &roster[j].1) {
-                let (na, nb) = (ca.trim().to_lowercase(), cb.trim().to_lowercase());
-                if !na.is_empty() && na == nb {
-                    return Some(format!(
+            if let (Some(na), Some(nb)) = (norm(&roster[i].1), norm(&roster[j].1)) {
+                if na == nb {
+                    return Heterogeneity::Collision(format!(
                         "{} and {} share model class '{na}': a same-class pair forfeits most of \
                          the error-decorrelation gain — pair different model classes (e.g. one \
                          Claude, one GPT) so the reviewer fails differently than the implementer",
@@ -575,7 +597,18 @@ fn heterogeneity_advisory(roster: &[(String, Option<String>)]) -> Option<String>
             }
         }
     }
-    None
+    let missing: Vec<String> = roster
+        .iter()
+        .filter(|(_, c)| norm(c).is_none())
+        .map(|(p, _)| p.clone())
+        .collect();
+    if missing.is_empty() {
+        Heterogeneity::Healthy
+    } else if missing.len() == roster.len() {
+        Heterogeneity::Undeclared
+    } else {
+        Heterogeneity::Unverified(missing)
+    }
 }
 
 /// Do a stored mission and supplied `--project` text name the SAME goal?
@@ -1731,14 +1764,23 @@ fn cmd_doctor(
                 );
                 roster_classes.push((a.persona.clone(), class));
             }
-            // Heterogeneity: warn on a same-class pair; nudge if none declared.
-            if let Some(adv) = heterogeneity_advisory(&roster_classes) {
-                warnings.push(adv);
-            } else if roster_classes.iter().all(|(_, c)| c.is_none()) {
-                println!(
+            // Heterogeneity: collision is a warning; a PARTIAL declaration is
+            // ALSO a warning (the check is inconclusive, not clean — Alice's
+            // catch); an all-undeclared roster is just a soft nudge.
+            match heterogeneity_status(&roster_classes) {
+                Heterogeneity::Collision(msg) => warnings.push(msg),
+                Heterogeneity::Unverified(missing) => warnings.push(format!(
+                    "heterogeneity UNVERIFIED — {} ha{} no model class declared; a single \
+                     unknown leaves the same-class risk unassessed. Declare it: `spriff join \
+                     --role <r> --class <claude|gpt|…>`",
+                    missing.join(", "),
+                    if missing.len() == 1 { "s" } else { "ve" }
+                )),
+                Heterogeneity::Undeclared => println!(
                     "  heterogeneity: model classes not declared — `spriff join --role <r> \
                      --class <claude|gpt|…>` lets spriff flag a same-class pairing"
-                );
+                ),
+                Heterogeneity::Healthy => {}
             }
         }
     }
@@ -1783,24 +1825,41 @@ mod tests {
     }
 
     #[test]
-    fn heterogeneity_advisory_flags_same_class_pairs() {
+    fn heterogeneity_status_classifies_all_four_outcomes() {
         let pair = |a: &str, ca: Option<&str>, b: &str, cb: Option<&str>| {
             vec![
                 (a.to_string(), ca.map(str::to_string)),
                 (b.to_string(), cb.map(str::to_string)),
             ]
         };
-        // Different classes -> healthy, no advisory.
-        assert!(
-            heterogeneity_advisory(&pair("Abbey", Some("claude"), "Alice", Some("gpt"))).is_none()
+        // Distinct, both declared -> Healthy.
+        assert_eq!(
+            heterogeneity_status(&pair("Abbey", Some("claude"), "Alice", Some("gpt"))),
+            Heterogeneity::Healthy
         );
-        // Same class (case/space-insensitive) -> warn, naming both + the class.
-        let w = heterogeneity_advisory(&pair("Abbey", Some("Claude"), "Alice", Some(" claude ")))
-            .expect("same-class pair must warn");
-        assert!(w.contains("Abbey") && w.contains("Alice") && w.contains("claude"));
-        // Unknown classes (either unset) -> can't conclude, so no false alarm.
-        assert!(heterogeneity_advisory(&pair("Abbey", None, "Alice", Some("gpt"))).is_none());
-        assert!(heterogeneity_advisory(&pair("Abbey", None, "Alice", None)).is_none());
+        // Same class (case/space-insensitive) -> Collision naming both + the class.
+        match heterogeneity_status(&pair("Abbey", Some("Claude"), "Alice", Some(" claude "))) {
+            Heterogeneity::Collision(w) => {
+                assert!(w.contains("Abbey") && w.contains("Alice") && w.contains("claude"));
+            }
+            other => panic!("expected Collision, got {other:?}"),
+        }
+        // PARTIAL: one declared, one not -> Unverified naming the missing peer
+        // (the bug Alice caught: this must NOT read as clean).
+        assert_eq!(
+            heterogeneity_status(&pair("Abbey", Some("claude"), "Alice", None)),
+            Heterogeneity::Unverified(vec!["Alice".to_string()])
+        );
+        // None declared -> Undeclared (soft nudge, not a warning).
+        assert_eq!(
+            heterogeneity_status(&pair("Abbey", None, "Alice", None)),
+            Heterogeneity::Undeclared
+        );
+        // An empty-string class counts as undeclared, not a match.
+        assert_eq!(
+            heterogeneity_status(&pair("Abbey", Some("  "), "Alice", Some("  "))),
+            Heterogeneity::Undeclared
+        );
     }
 
     #[test]
