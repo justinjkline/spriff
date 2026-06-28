@@ -591,6 +591,33 @@ fn plan_mission(
     }
 }
 
+/// Run `f` while holding an exclusive, kernel-arbitrated lock keyed on the collab
+/// name, so concurrent first-joins of the SAME collaboration serialize: exactly
+/// one process is the creator (deterministic roster), the rest observe the
+/// finished config and join. Crash-safe — the OS releases the lock if the holder
+/// dies — and free of any read-then-act TOCTOU. The lock file lives at the
+/// registry root (`<SPRIFF_HOME>/.<name>.create.lock`) and is never unlinked, so
+/// every joiner flocks the same inode. (Alice's concurrent-rendezvous catch.)
+fn with_create_lock<T>(name: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use fs2::FileExt;
+    let root = registry::root();
+    std::fs::create_dir_all(&root).ok();
+    let lock_path = root.join(format!(".{name}.create.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening create-lock {}", lock_path.display()))?;
+    // Blocks until we hold the lock; a concurrent joiner waits here, then sees the
+    // config the winner wrote and takes the join path.
+    file.lock_exclusive()
+        .with_context(|| format!("locking create-lock {}", lock_path.display()))?;
+    let result = f();
+    let _ = FileExt::unlock(&file); // also released on drop / process death.
+    result
+}
+
 /// The serve singleton-lock file for one persona on one board:
 /// `<base>.<persona>.serve.lock`, next to the other sidecars.
 fn serve_lock_path(board: &std::path::Path, persona: &str) -> PathBuf {
@@ -901,33 +928,42 @@ fn cmd_join(
         (1usize, 0usize)
     };
 
-    // Create it if it doesn't exist yet (first agent to join wins; idempotent).
-    let created = !registry::config_path(&name).exists();
-    if created {
-        let mut roster = build_roster(agents.max(2), None, &[]);
-        if let Some(n) = &as_name {
-            roster[my_slot] = n.clone();
-        }
-        if let Some(n) = &with {
-            roster[peer_slot] = n.clone();
-        }
-        create_collab(&name, &roster, None)?;
-    }
-    let cfg = Config::load(&registry::config_path(&name))?;
-
-    // Mission reconciliation for --project — one path for create AND join, so the
-    // goal is seeded once and a later agent can't silently diverge from it. On
-    // create `read_mission` is None → Seed; on join we Keep iff the goal matches
-    // (or --collab forced the slug) and otherwise hard-error. (Alice's catch.)
-    if let Some(p) = &project {
-        let board = cfg.board_path();
-        match plan_mission(read_mission(&board).as_deref(), p, collab_explicit, &name)? {
-            MissionPlan::Seed => {
-                std::fs::write(mission_path(&board), format!("{}\n", p)).ok();
+    // Create-or-join, serialized so two agents launched at the SAME instant from
+    // the same --project can't both run create_collab. Without the lock that race
+    // is real and nasty: both see `created = true`, both pick a roster letter from
+    // `used_letters()` (whose result depends on whether the *other* process has
+    // registered yet), and the second create_collab overwrites the config — which
+    // can leave one agent's `.spriff` marker pointing at a persona that is no
+    // longer on the roster (off-roster → every later command for that agent
+    // breaks). The kernel advisory lock makes exactly one process the creator
+    // (deterministic roster) and the rest observe the finished config and join.
+    // Mission reconciliation runs under the SAME lock so read-None-then-seed is
+    // atomic with creation. (Alice's concurrent-rendezvous catch.)
+    let (cfg, created) = with_create_lock(&name, || {
+        let created = !registry::config_path(&name).exists();
+        if created {
+            let mut roster = build_roster(agents.max(2), None, &[]);
+            if let Some(n) = &as_name {
+                roster[my_slot] = n.clone();
             }
-            MissionPlan::Keep => {}
+            if let Some(n) = &with {
+                roster[peer_slot] = n.clone();
+            }
+            create_collab(&name, &roster, None)?;
         }
-    }
+        let cfg = Config::load(&registry::config_path(&name))?;
+        // Seed the goal once / keep if it matches / hard-error on divergence.
+        if let Some(p) = &project {
+            let board = cfg.board_path();
+            match plan_mission(read_mission(&board).as_deref(), p, collab_explicit, &name)? {
+                MissionPlan::Seed => {
+                    std::fs::write(mission_path(&board), format!("{}\n", p)).ok();
+                }
+                MissionPlan::Keep => {}
+            }
+        }
+        Ok((cfg, created))
+    })?;
 
     // The canonical persona for my role IS the roster slot. Identity must stay
     // canonical or every downstream invariant (peers, sidecars, addressees, turn
