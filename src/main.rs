@@ -96,6 +96,10 @@ enum Cmd {
         collab: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Diagnose as this persona (so the loop-preserving `--as <you>` rule
+        /// works on `doctor` too, and the identity source is shown for it).
+        #[arg(long = "as")]
+        as_persona: Option<String>,
     },
 
     /// Print the agent collaboration protocol (the SKILL file). Point any CLI
@@ -324,7 +328,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Doctor { collab, config } => cmd_doctor(collab, config),
+        Cmd::Doctor {
+            collab,
+            config,
+            as_persona,
+        } => cmd_doctor(collab, config, as_persona),
         Cmd::Skill => {
             print!("{SKILL}");
             Ok(())
@@ -545,7 +553,20 @@ fn acquire_serve_lock(board: &std::path::Path, persona: &str) -> Result<ServeLoc
         .open(&path)
         .with_context(|| format!("opening serve lock {}", path.display()))?;
 
-    match file.try_lock_exclusive() {
+    // Retry briefly before declaring a duplicate: a REAL serve holds the lock for
+    // its whole lifetime, so retrying still fails against it — but a momentary
+    // holder (e.g. `spriff doctor`'s non-destructive lock PROBE) is gone within
+    // milliseconds, so the grace window lets a legitimate serve start win the
+    // race. (Alice's fix for the doctor-probe race.)
+    let mut last = file.try_lock_exclusive();
+    for _ in 0..10 {
+        if last.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        last = file.try_lock_exclusive();
+    }
+    match last {
         Ok(()) => {
             // We hold the kernel lock. Record our pid as DIAGNOSTIC text only —
             // ownership is decided by the kernel lock, never by this content.
@@ -1315,10 +1336,30 @@ fn is_serve_running(board: &std::path::Path, persona: &str) -> bool {
     }
 }
 
+/// Roster/identity warnings for a resolved persona (pure + testable).
+fn identity_warnings(cfg: &Config, name: &str, persona: &str) -> Vec<String> {
+    let mut w = Vec::new();
+    let on_roster = cfg
+        .agents
+        .iter()
+        .any(|a| a.persona.eq_ignore_ascii_case(persona));
+    if !on_roster {
+        w.push(format!(
+            "resolved persona '{persona}' is NOT on the '{name}' roster — peer posts will look empty/wrong (use --as or $SPRIFF_AS)"
+        ));
+    }
+    w
+}
+
 /// Health-check: aggregate the state an operator needs when something seems off —
 /// registry, the cwd's resolved identity (the #1 footgun), board + per-persona
 /// unread/cursor, whether a `serve` is running, and roster/identity warnings.
-fn cmd_doctor(collab: Option<String>, config: Option<PathBuf>) -> Result<()> {
+/// `as_persona` lets the loop-preserving `--as <you>` rule work on `doctor` too.
+fn cmd_doctor(
+    collab: Option<String>,
+    config: Option<PathBuf>,
+    as_persona: Option<String>,
+) -> Result<()> {
     let mut warnings: Vec<String> = Vec::new();
     println!("spriff doctor\n=============");
 
@@ -1349,17 +1390,11 @@ fn cmd_doctor(collab: Option<String>, config: Option<PathBuf>) -> Result<()> {
     match resolve(collab, config) {
         Err(e) => println!("  (no active collaboration: {e})"),
         Ok((cfg, name)) => {
-            let (persona, source) = resolve_persona_with_source(None, &cfg);
-            let on_roster = cfg
-                .agents
-                .iter()
-                .any(|a| a.persona.eq_ignore_ascii_case(&persona));
+            // Honour an explicit --as so doctor can confirm the safe invocation
+            // pattern the join brief mandates (and show "identity from --as flag").
+            let (persona, source) = resolve_persona_with_source(as_persona, &cfg);
             println!("  resolves to: '{name}' as '{persona}' (identity from {source})");
-            if !on_roster {
-                warnings.push(format!(
-                    "resolved persona '{persona}' is NOT on the '{name}' roster — peer posts will look empty/wrong (use --as or $SPRIFF_AS)"
-                ));
-            }
+            warnings.extend(identity_warnings(&cfg, &name, &persona));
 
             let board = cfg.board_path();
             println!(
@@ -1467,6 +1502,21 @@ mod tests {
         assert!(acquire_serve_lock(&board, "Alice").is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn identity_warnings_flags_off_roster_only() {
+        let cfg: Config = toml::from_str(
+            "board = \"/x/b.md\"\n[[agents]]\npersona = \"Abbey\"\n[[agents]]\npersona = \"Alice\"\n",
+        )
+        .unwrap();
+        // On-roster (case-insensitive) -> no warning.
+        assert!(identity_warnings(&cfg, "demo", "Alice").is_empty());
+        assert!(identity_warnings(&cfg, "demo", "abbey").is_empty());
+        // Off-roster -> exactly one warning naming the persona.
+        let w = identity_warnings(&cfg, "demo", "Vera");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("Vera"));
     }
 
     #[test]

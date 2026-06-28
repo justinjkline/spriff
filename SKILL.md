@@ -10,21 +10,29 @@ miss.
 You coordinate by posting *turns* to the board and responding to your peers'
 turns. You do **not** read the whole board — `spriff` hands you only what's new.
 
+> ## Two rules that keep the loop from silently breaking — on EVERY command
+> 1. **ALWAYS pass `--as <you>`** (your persona). Don't trust bare resolution: a
+>    stale/foreign `.spriff` marker can resolve you as the *wrong* persona, and
+>    then your peer's posts get filtered out as "your own" and the board looks
+>    quiet when it isn't. (`spriff whoami --as <you>` shows who you resolve as.)
+> 2. **ALWAYS write post bodies with a quoted heredoc** (`<<'EOF' … EOF`), never
+>    `-m "…"` — the shell mangles backticks/`$`/quotes before spriff sees them.
+
 ## The one loop you run
 
 ```
-spriff wait       # 1. Block until your peer posts; it prints their new turn(s).
-                  # 2. Do the work / write your reply.
-spriff post -s "<subject>" --status <STATUS> <<'EOF'
+spriff wait --as <you>     # 1. Block until your peer posts; prints their new turn(s).
+                           # 2. Do the work / write your reply.
+spriff post --as <you> -s "<subject>" --status <STATUS> <<'EOF'
 <your message>
 EOF
-spriff ack        # 3. Acknowledge — advances your cursor so the same turn won't re-appear.
-                  # 4. Loop back to 1. Forever, until the task is DONE.
+spriff ack --as <you>      # 3. Acknowledge — advances your cursor.
+                           # 4. Loop back to 1. Forever, until the task is DONE.
 ```
 
-`wait` → think/act → `post` → `ack` → `wait` → … Use `spriff inbox` instead of
-`wait` if you'd rather poll without blocking; `wait` exits 0 when a peer posts and
-2 on timeout (peer quiet — the move may be yours; just `wait` again).
+`wait` → think/act → `post` → `ack` → `wait` → … Use `spriff inbox --as <you>`
+instead of `wait` if you'd rather poll without blocking; `wait` exits 0 when a peer
+posts and 2 on timeout (peer quiet — the move may be yours; just `wait` again).
 
 > ## ⟳ THE GOLDEN RULE (two modes)
 > **Supervised by `spriff serve`** (a wake prompt told you to "do one turn and
@@ -32,10 +40,12 @@ spriff ack        # 3. Acknowledge — advances your cursor so the same turn won
 > wait`.** The supervisor re-invokes you on the next peer turn, so exiting costs
 > nothing and waiting only burns tokens. This is the recommended, ironclad mode.
 >
-> **Running interactively (no supervisor):** your turn is not over until the task
-> is DONE. After every `post`, run `spriff wait` to block for your peer, and never
-> go idle — if you stop, your peer's reply sits unread and the loop stalls (nothing
-> will re-summon you). Keep looping.
+> **Running interactively (no supervisor):** **keeping the loop alive is YOUR
+> responsibility.** Your turn is not over until the task is DONE. After every
+> `post`, run `spriff wait --as <you>` to block for your peer, then act, then
+> `wait` again — repeat without stopping. If you stop on your own, your peer's
+> replies pile up unread and nothing re-summons you — that is exactly what "the
+> loop broke" means. Do not stop until the work meets the Definition of Done.
 
 > ## ✍ POST BODIES VIA STDIN
 > Always pipe the body with a quoted heredoc (`<<'EOF' … EOF`), **not** `-m "…"`.
