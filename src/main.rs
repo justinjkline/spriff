@@ -522,6 +522,60 @@ fn read_mission(board: &std::path::Path) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+/// Do a stored mission and supplied `--project` text name the SAME goal?
+/// Lenient on case and on surrounding/collapsed whitespace — those are the same
+/// goal phrased slightly differently. Strict on everything else, so two prompts
+/// that slugify to the same board but mean different things (Alice's example:
+/// `"a/b"` vs `"a b"`, both → slug `a-b`) are correctly seen as DIFFERENT.
+fn mission_eq(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+    norm(a) == norm(b)
+}
+
+/// What `join --project` should do with the mission once it has resolved a board.
+#[derive(Debug, PartialEq, Eq)]
+enum MissionPlan {
+    /// No mission yet — seed it from the supplied project text.
+    Seed,
+    /// A mission already names this goal (or the slug was forced) — leave it.
+    Keep,
+}
+
+/// Decide the mission action when `--project` resolved a board — PURE (no FS), so
+/// the seed/keep/reject logic is fully unit-tested.
+///
+/// The bug this guards (Alice's silent-divergence catch): seeding the mission
+/// only on *create* meant a second agent whose `--project` slugified onto an
+/// existing board would join *displaying its own goal* while the board's mission
+/// was the first agent's. Two agents "synchronized" on different goals. So:
+///   * no mission yet            → `Seed` (first agent's goal becomes the mission);
+///   * mission names this goal   → `Keep`;
+///   * `--collab` forced the slug→ `Keep` (the operator joined intentionally);
+///   * mission names a DIFFERENT goal → hard-error with explicit remediation.
+fn plan_mission(
+    existing: Option<&str>,
+    project: &str,
+    collab_explicit: bool,
+    name: &str,
+) -> Result<MissionPlan> {
+    match existing {
+        None => Ok(MissionPlan::Seed),
+        Some(_) if collab_explicit => Ok(MissionPlan::Keep),
+        Some(m) if mission_eq(m, project) => Ok(MissionPlan::Keep),
+        Some(m) => anyhow::bail!(
+            "project \"{project}\" maps to existing board '{name}', but that board's \
+             mission is \"{m}\". Two agents would rendezvous on the same board while \
+             disagreeing on the goal. Use the exact project text, pass --collab {name} \
+             to join it intentionally, or choose a more specific --project.",
+        ),
+    }
+}
+
 /// The serve singleton-lock file for one persona on one board:
 /// `<base>.<persona>.serve.lock`, next to the other sidecars.
 fn serve_lock_path(board: &std::path::Path, persona: &str) -> PathBuf {
@@ -804,6 +858,10 @@ fn cmd_join(
     //   5. "default" ONLY when nothing is registered; if several exist and the
     //      agent gave no signal, STOP and ask for --project/--collab rather than
     //      silently joining the wrong board.
+    // Was the slug forced explicitly? If so, `--project` is just a mission label
+    // and we do NOT enforce mission match (the operator chose this board on
+    // purpose). Capture before `collab` is moved into the resolution below.
+    let collab_explicit = collab.is_some();
     let name = if let Some(c) = collab {
         c
     } else if let Some(p) = &project {
@@ -839,15 +897,22 @@ fn cmd_join(
             roster[peer_slot] = n.clone();
         }
         create_collab(&name, &roster, None)?;
-        // Seed the mission from --project so the goal is on the board for both
-        // agents (and injected into any `serve` prompts). An existing collab keeps
-        // its mission — we don't overwrite a peer's.
-        if let Some(p) = &project {
-            let cfg0 = Config::load(&registry::config_path(&name))?;
-            std::fs::write(mission_path(&cfg0.board_path()), format!("{}\n", p)).ok();
-        }
     }
     let cfg = Config::load(&registry::config_path(&name))?;
+
+    // Mission reconciliation for --project — one path for create AND join, so the
+    // goal is seeded once and a later agent can't silently diverge from it. On
+    // create `read_mission` is None → Seed; on join we Keep iff the goal matches
+    // (or --collab forced the slug) and otherwise hard-error. (Alice's catch.)
+    if let Some(p) = &project {
+        let board = cfg.board_path();
+        match plan_mission(read_mission(&board).as_deref(), p, collab_explicit, &name)? {
+            MissionPlan::Seed => {
+                std::fs::write(mission_path(&board), format!("{}\n", p)).ok();
+            }
+            MissionPlan::Keep => {}
+        }
+    }
 
     // The canonical persona for my role IS the roster slot. Identity must stay
     // canonical or every downstream invariant (peers, sidecars, addressees, turn
@@ -1603,6 +1668,52 @@ mod tests {
         assert_eq!(slugify("My Project"), slugify("my   project"));
         // Never empty.
         assert_eq!(slugify("***"), "project");
+    }
+
+    #[test]
+    fn mission_eq_is_lenient_on_form_strict_on_meaning() {
+        // Same goal, different surface form (case + whitespace) -> equal.
+        assert!(mission_eq(
+            "Fix the checkout flow",
+            "fix   the checkout flow"
+        ));
+        assert!(mission_eq("  ship it  ", "ship it"));
+        // Alice's collision case: two prompts that slugify to the SAME board
+        // (`a-b`) but mean different things must NOT be treated as the same goal.
+        assert_eq!(slugify("a/b"), slugify("a b")); // same board…
+        assert!(!mission_eq("a/b", "a b")); // …different goal.
+    }
+
+    #[test]
+    fn plan_mission_seed_keep_reject() {
+        // No mission yet -> seed it from the project text.
+        assert_eq!(
+            plan_mission(None, "fix checkout", false, "fix-checkout").unwrap(),
+            MissionPlan::Seed
+        );
+        // Mission already names this goal (case/space-insensitive) -> keep.
+        assert_eq!(
+            plan_mission(
+                Some("Fix Checkout"),
+                "fix   checkout",
+                false,
+                "fix-checkout"
+            )
+            .unwrap(),
+            MissionPlan::Keep
+        );
+        // Mission names a DIFFERENT goal on the same slug -> hard error that names
+        // both goals and the remediation paths.
+        let err = plan_mission(Some("a/b"), "a b", false, "a-b")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a b") && err.contains("a/b") && err.contains("a-b"));
+        assert!(err.contains("--collab"));
+        // …unless --collab forced the slug: the operator joined intentionally.
+        assert_eq!(
+            plan_mission(Some("a/b"), "a b", true, "a-b").unwrap(),
+            MissionPlan::Keep
+        );
     }
 
     #[test]
