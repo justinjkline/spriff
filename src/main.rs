@@ -1140,8 +1140,14 @@ fn cmd_join(
         let created = !registry::config_path(&name).exists();
         if created {
             let mut roster = build_roster(agents.max(2), None, &[]);
+            // Resolve MY slot against the GENERATED roster, not the hardcoded
+            // default — otherwise a reviewer that CREATES the board (reviewer #2
+            // winning the create race) writes its name over slot 1, duplicating
+            // itself and dropping the first reviewer (`Abbey, Annie, Annie`).
+            // (Alice's catch: the slot fix must participate in creation too.)
+            let create_slot = resolve_my_slot(is_review, as_name.as_deref(), my_slot, &roster);
             if let Some(n) = &as_name {
-                roster[my_slot] = n.clone();
+                roster[create_slot] = n.clone();
             }
             if let Some(n) = &with {
                 roster[peer_slot] = n.clone();

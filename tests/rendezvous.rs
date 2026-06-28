@@ -521,3 +521,63 @@ fn second_reviewer_can_join_and_declare_a_lens() {
     assert!(stdout(&sb.run(&b, &["status", "--as", "Alice"])).contains("security"));
     assert!(stdout(&sb.run(&c, &["status", "--as", "Annie"])).contains("correctness"));
 }
+
+// ---------------------------------------------------------------------------
+// 9. Reviewer #2 may CREATE the crew first (win the create race) without
+//    corrupting the generated roster. (Alice's catch: the slot fix must apply at
+//    creation too, else `--as Annie` overwrote slot 1 → Abbey, Annie, Annie.)
+// ---------------------------------------------------------------------------
+#[test]
+fn second_reviewer_can_create_the_crew_first() {
+    let sb = Sandbox::new("revfirst");
+    let c = sb.cwd("rev2");
+    let o = sb.run(
+        &c,
+        &[
+            "join",
+            "--role",
+            "reviewer",
+            "--as",
+            "Annie",
+            "--with",
+            "Abbey",
+            "--project",
+            "rev first trio",
+            "--agents",
+            "3",
+            "--lens",
+            "correctness",
+        ],
+    );
+    assert!(
+        o.status.success(),
+        "reviewer-first create failed: {}",
+        stderr(&o)
+    );
+    assert!(
+        marker(&c).contains("as=Annie"),
+        "rev2 marker: {}",
+        marker(&c)
+    );
+
+    // The generated roster must stay intact: exactly one each of Abbey/Alice/Annie.
+    let cfg = std::fs::read_to_string(sb.root.join("rev-first-trio").join("rev-first-trio.toml"))
+        .expect("config written");
+    assert_eq!(
+        cfg.matches("persona = \"Abbey\"").count(),
+        1,
+        "roster: {cfg}"
+    );
+    assert_eq!(
+        cfg.matches("persona = \"Alice\"").count(),
+        1,
+        "Alice dropped: {cfg}"
+    );
+    assert_eq!(
+        cfg.matches("persona = \"Annie\"").count(),
+        1,
+        "Annie duplicated: {cfg}"
+    );
+    // Annie's lens still landed.
+    assert!(stdout(&sb.run(&c, &["status", "--as", "Annie"])).contains("correctness"));
+}
