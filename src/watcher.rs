@@ -68,6 +68,7 @@ pub fn run(cfg: &Config, persona: &str) -> Result<()> {
         cfg,
         persona,
         &board_path,
+        &sc.log,
     );
 
     log(
@@ -129,6 +130,7 @@ pub fn run(cfg: &Config, persona: &str) -> Result<()> {
             cfg,
             persona,
             &board_path,
+            &sc.log,
         );
         if added > 0 {
             let msg = format!(
@@ -238,6 +240,7 @@ fn reconcile_sources(
     cfg: &Config,
     persona: &str,
     board_path: &Path,
+    log_path: &Path,
 ) -> usize {
     let mut desired = cfg.peer_watchpaths(persona);
     for peer in cfg.peers(persona) {
@@ -250,10 +253,25 @@ fn reconcile_sources(
             // Store the CANONICAL path so it compares equal to FSEvents paths,
             // which resolve symlinks (e.g. macOS /var -> /private/var).
             let target = canon(&target);
-            if watched.insert(target.clone())
-                && watcher.watch(&target, RecursiveMode::Recursive).is_ok()
-            {
-                added += 1;
+            if watched.contains(&target) {
+                continue;
+            }
+            // Only record the path as watched AFTER notify accepts it. If the
+            // registration fails (transient backend error, watch limit, …) we
+            // log it and leave it unrecorded so the next reconcile retries —
+            // never a silent "we think it's covered but it isn't". (Alice's catch.)
+            match watcher.watch(&target, RecursiveMode::Recursive) {
+                Ok(()) => {
+                    watched.insert(target);
+                    added += 1;
+                }
+                Err(e) => log(
+                    log_path,
+                    &format!(
+                        "watch failed for {}: {e}; will retry next pass",
+                        target.display()
+                    ),
+                ),
             }
         }
     }

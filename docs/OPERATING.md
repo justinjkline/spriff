@@ -196,8 +196,10 @@ Per collaboration, alongside the board:
   already `ack`ed past it, that's correct (you consumed it).
 - **Agent keeps re-seeing the same turn** — it isn't running `spriff ack` after
   replying. `ack` advances the cursor.
-- **Watcher seems silent** — check `<name>.<persona>.watch.log`. Ensure the
-  peer's `watchpaths` exist; non-existent paths are skipped.
+- **Watcher seems silent** — check `<name>.<persona>.watch.log`. It logs the
+  active source-path count and any `watch failed …` errors. A declared path that
+  doesn't exist yet is covered by watching its nearest existing ancestor, so it
+  still fires when the file appears; the actionable signal is always a board post.
 - **Stale flag after a manual board edit** — `spriff ack` clears it. (And don't
   hand-edit the board; post instead.)
 - **Two watchers for one persona** — run only one per persona; a second is
