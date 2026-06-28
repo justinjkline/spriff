@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
 use paths::Sidecars;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -493,6 +493,73 @@ fn read_mission(board: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(mission_path(board)).ok()?;
     let t = text.trim();
     (!t.is_empty()).then(|| t.to_string())
+}
+
+/// The serve singleton-lock file for one persona on one board:
+/// `<base>.<persona>.serve.lock`, next to the other sidecars.
+fn serve_lock_path(board: &std::path::Path, persona: &str) -> PathBuf {
+    let state = Sidecars::derive(board, persona).state; // <base>.<persona>.watch.state
+    let s = state.to_string_lossy();
+    PathBuf::from(format!("{}serve.lock", s.trim_end_matches("watch.state")))
+}
+
+/// Is `pid` a live process? Uses `kill -0` (POSIX), no extra dependency.
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Singleton lock guarding one `serve` per (collab, persona). Removes the lock on
+/// drop (normal exit / panic); a hard kill leaves a stale lock, which the next
+/// acquire reclaims after checking the recorded pid is dead.
+struct ServeLock {
+    path: PathBuf,
+}
+impl Drop for ServeLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire the serve singleton lock, or error if another LIVE serve holds it.
+/// This is the ironclad guard against two supervisors driving the same persona
+/// (which silently double-posts and races the cursor).
+fn acquire_serve_lock(board: &std::path::Path, persona: &str) -> Result<ServeLock> {
+    let path = serve_lock_path(board, persona);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                write!(f, "{}", std::process::id())?;
+                return Ok(ServeLock { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let held = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                match held {
+                    Some(pid) if pid_alive(pid) => anyhow::bail!(
+                        "another `spriff serve` is already running as {persona} (pid {pid}). \
+                         Only one supervisor per persona — stop it first (kill {pid})."
+                    ),
+                    // Stale lock from a hard-killed serve: reclaim and retry.
+                    _ => {
+                        std::fs::remove_file(&path).ok();
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Resolve (config, name) from optional flags, honouring the registry priority
@@ -996,6 +1063,11 @@ fn cmd_serve(
         );
     }
 
+    // Singleton: refuse to start if another live serve already drives this
+    // persona (the duplicate-supervisor case that silently double-posts). Held
+    // for the lifetime of this function; released on exit.
+    let _lock = acquire_serve_lock(&cfg.board_path(), persona)?;
+
     let interval = Duration::from_secs(poll.max(1));
     const MAX_ATTEMPTS: u32 = 3;
     let mission = read_mission(&cfg.board_path());
@@ -1232,5 +1304,35 @@ mod tests {
         assert!(p.contains("EXIT"));
         assert!(p.contains("do NOT run `spriff wait`"));
         assert!(p.contains("spriff ack"));
+    }
+
+    #[test]
+    fn serve_lock_path_is_per_persona() {
+        assert_eq!(
+            serve_lock_path(Path::new("/x/foo.board.md"), "Alice"),
+            PathBuf::from("/x/foo.alice.serve.lock")
+        );
+    }
+
+    #[test]
+    fn serve_lock_is_exclusive_then_reclaimable() {
+        let dir = std::env::temp_dir().join(format!("spriff-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let board = dir.join("t.board.md");
+        std::fs::write(&board, "x").unwrap();
+
+        let lock = acquire_serve_lock(&board, "Alice").unwrap();
+        // A second acquire while the first is held (our own live pid) must fail.
+        assert!(acquire_serve_lock(&board, "Alice").is_err());
+        drop(lock); // release
+                    // After release, acquiring again succeeds.
+        assert!(acquire_serve_lock(&board, "Alice").is_ok());
+
+        // A stale lock (dead pid) is reclaimed.
+        let p = serve_lock_path(&board, "Bob");
+        std::fs::write(&p, "999999999").unwrap(); // not a live pid
+        assert!(acquire_serve_lock(&board, "Bob").is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
