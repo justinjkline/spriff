@@ -53,6 +53,12 @@ enum Cmd {
         /// Your role: implementer (executor) or reviewer.
         #[arg(long)]
         role: String,
+        /// Your persona name (e.g. Pamela). Defaults to the auto-assigned name.
+        #[arg(long = "as")]
+        as_name: Option<String>,
+        /// Your peer's persona name (e.g. Peter), used when creating the roster.
+        #[arg(long = "with")]
+        with: Option<String>,
         /// Collaboration name. Default: the single registered one, else "default".
         #[arg(long)]
         collab: Option<String>,
@@ -204,10 +210,12 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Join {
             role,
+            as_name,
+            with,
             collab,
             repo,
             agents,
-        } => cmd_join(&role, collab, repo, agents),
+        } => cmd_join(&role, as_name, with, collab, repo, agents),
         Cmd::Skill => {
             print!("{SKILL}");
             Ok(())
@@ -437,6 +445,8 @@ fn resolve_persona(explicit: Option<String>, cfg: &Config) -> String {
 /// protocol + first move. The single command an agent runs to start.
 fn cmd_join(
     role: &str,
+    as_name: Option<String>,
+    with: Option<String>,
     collab: Option<String>,
     repo: Option<PathBuf>,
     agents: usize,
@@ -468,21 +478,37 @@ fn cmd_join(
         .unwrap_or_else(|| "default".to_string());
 
     // Create it if it doesn't exist yet (first agent to join wins; idempotent).
+    // Custom names (--as / --with) override the auto-assigned roster by role:
+    // implementer = executor (index 0), reviewer = index 1.
     if !registry::config_path(&name).exists() {
-        let roster = build_roster(agents, None, &[]);
+        let mut roster = build_roster(agents.max(2), None, &[]);
+        let (exec_slot, rev_slot) = if is_impl {
+            (0usize, 1usize)
+        } else {
+            (1usize, 0usize)
+        };
+        if let Some(n) = &as_name {
+            roster[if is_impl { exec_slot } else { rev_slot }] = n.clone();
+        }
+        if let Some(n) = &with {
+            roster[if is_impl { rev_slot } else { exec_slot }] = n.clone();
+        }
         create_collab(&name, &roster, None)?;
     }
     let cfg = Config::load(&registry::config_path(&name))?;
 
-    // Claim the role's persona: implementer = executor (index 0), reviewer =
-    // first reviewer (index 1).
-    let persona = if is_impl {
-        cfg.agents.first()
-    } else {
-        cfg.agents.get(1)
-    }
-    .map(|a| a.persona.clone())
-    .ok_or_else(|| anyhow::anyhow!("collaboration '{name}' has no slot for role '{role}'"))?;
+    // Claim the role's persona. An explicit --as wins (you named yourself);
+    // otherwise it's the role's roster slot (implementer = index 0, reviewer = 1).
+    let persona = match as_name {
+        Some(n) => n,
+        None => (if is_impl {
+            cfg.agents.first()
+        } else {
+            cfg.agents.get(1)
+        })
+        .map(|a| a.persona.clone())
+        .ok_or_else(|| anyhow::anyhow!("collaboration '{name}' has no slot for role '{role}'"))?,
+    };
 
     // Write the repo marker so bare `spriff` commands here act as this persona.
     let repo = repo

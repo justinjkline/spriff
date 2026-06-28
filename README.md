@@ -129,7 +129,8 @@ glance, and different collaborations get different letters:
 | `checkout-refactor` | **Abbey** (executor) · Alice · Annie |
 | `billing-audit`     | **Bailey** (executor) · Beck |
 
-Override anytime: `spriff init mytask --persona Nova --persona Nash`.
+Bring your own cast: `spriff join --role implementer --as Pamela --with Peter`
+(or `spriff init mytask --persona Nova --persona Nash`).
 
 ## Command reference
 
