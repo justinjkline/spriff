@@ -319,7 +319,71 @@ pub fn rollup(board: &Path, keep_recent: usize) -> Result<usize> {
     ));
     new_board.push_str(kept_part);
     crate::util::atomic_write(board, new_board.as_bytes())?;
+
+    // CRITICAL: a rollup shifts the board's byte coordinates, so every per-persona
+    // byte cursor is now stale. Remap each sibling cursor from old -> new
+    // coordinates. Without this, a rollup with no running watcher silently FREEZES
+    // the loop: a consume cursor left pointing past the now-smaller board makes
+    // `wait`/`inbox` see "nothing new" forever, stranding every unread turn behind
+    // it. (Real incident: a reviewer's posts stopped reaching the peer after the
+    // board crossed the rollup threshold.) The watcher's old `offset = size` clamp
+    // was both watcher-only and lossy; this preserves the exact read position.
+    let new_kept_start = (new_board.len() - kept_part.len()) as u64;
+    remap_sibling_cursors(board, cut as u64, new_kept_start, new_board.len() as u64);
     Ok(archived_count)
+}
+
+/// Map a byte cursor across a rollup. PURE + testable. A cursor at or before the
+/// cut (it had not finished reading the turns that just got archived) lands at the
+/// START of the kept turns, so all kept turns read as unread; a cursor already
+/// inside the kept region keeps its exact relative position. Clamped to the new
+/// board length so a previously-desynced (too-large) offset can't strand the loop.
+fn remap_offset(old: u64, cut: u64, new_kept_start: u64, new_len: u64) -> u64 {
+    let mapped = if old <= cut {
+        new_kept_start
+    } else {
+        new_kept_start + (old - cut)
+    };
+    mapped.min(new_len)
+}
+
+/// The board's sidecar base stem (mirrors `paths::Sidecars`: strip `.md`, then
+/// `.board`), used to find `<base>.<persona>.watch.state` cursor files.
+fn state_base(board: &Path) -> String {
+    let mut base = board
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if let Some(s) = base.strip_suffix(".md") {
+        base = s.to_string();
+    }
+    if let Some(s) = base.strip_suffix(".board") {
+        base = s.to_string();
+    }
+    base
+}
+
+/// Remap every `<base>.<persona>.watch.state` cursor beside `board` across a
+/// rollup. Best-effort: a cursor we can't read/write is skipped (the read-path
+/// clamp will still keep it from stranding the loop).
+fn remap_sibling_cursors(board: &Path, cut: u64, new_kept_start: u64, new_len: u64) {
+    let Some(dir) = board.parent() else { return };
+    let prefix = format!("{}.", state_base(board));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) && name.ends_with(".watch.state") {
+            let p = e.path();
+            let mut st = crate::state::WatchState::load(&p);
+            let remapped = remap_offset(st.offset, cut, new_kept_start, new_len);
+            if remapped != st.offset {
+                st.offset = remapped;
+                let _ = st.save(&p);
+            }
+        }
+    }
 }
 
 /// Seed a brand-new board with its title line. The protocol preamble itself is
@@ -455,6 +519,74 @@ mod tests {
             3
         );
         assert!(archive_path(&board).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remap_offset_maps_across_rollup() {
+        // cut = old start of kept turns; new_kept_start = where kept turns begin
+        // in the rewritten board; new_len = new board length.
+        // At/before the cut -> the start of the kept turns (all kept turns unread).
+        assert_eq!(remap_offset(0, 100, 20, 70), 20);
+        assert_eq!(remap_offset(100, 100, 20, 70), 20);
+        // Inside the kept region -> relative position preserved.
+        assert_eq!(remap_offset(130, 100, 20, 70), 50); // 20 + (130-100)
+                                                        // A previously-desynced, too-large offset is clamped to the new board end.
+        assert_eq!(remap_offset(99_999, 100, 20, 70), 70);
+    }
+
+    #[test]
+    fn rollup_remaps_cursor_so_unread_turn_survives() {
+        // Reproduces the freeze incident: a reader who hasn't caught up must STILL
+        // see their unread turns after a rollup — the cursor must be remapped, not
+        // left pointing into the old (now-archived) coordinate space.
+        let dir = std::env::temp_dir().join(format!("spriff-remap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let board = dir.join("t.board.md");
+        seed_board(&board, "t").unwrap();
+        for i in 1..=5 {
+            append_turn(
+                &board,
+                &format!("2026-01-01T0{i}:00Z"),
+                "Peter",
+                &format!("turn {i}"),
+                "FYI",
+                &[],
+                &format!("body {i}"),
+            )
+            .unwrap();
+        }
+        // Pamela has read turns 1–3; her cursor sits at the start of turn 4.
+        let content = std::fs::read_to_string(&board).unwrap();
+        let cursor_before = header_offsets(&content)[3] as u64;
+        let state = crate::paths::Sidecars::derive(&board, "Pamela").state;
+        crate::state::WatchState {
+            offset: cursor_before,
+            last_pending_header: String::new(),
+        }
+        .save(&state)
+        .unwrap();
+        assert_eq!(
+            delta_since(&board, cursor_before, "Pamela").unwrap().len(),
+            2,
+            "precondition: Pamela has 2 unread turns before rollup"
+        );
+
+        // Roll up, keeping the last 2 turns (archives turns 1–3).
+        assert_eq!(rollup(&board, 2).unwrap(), 3);
+
+        // After rollup, Pamela's remapped cursor must STILL surface exactly her two
+        // unread turns — not strand them behind a now-too-large offset.
+        let remapped = crate::state::WatchState::load(&state).offset;
+        let after = delta_since(&board, remapped, "Pamela").unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "rollup stranded the unread turns — cursor was not remapped"
+        );
+        assert_eq!(after[0].subject, "turn 4");
+        assert_eq!(after[1].subject, "turn 5");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
