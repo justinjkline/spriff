@@ -1309,7 +1309,17 @@ fn cmd_post(
 fn current_delta(cfg: &Config, persona: &str) -> Result<Vec<board::Turn>> {
     let board_path = cfg.board_path();
     let sc = Sidecars::derive(&board_path, persona);
-    let st = state::WatchState::load(&sc.state);
+    let mut st = state::WatchState::load(&sc.state);
+    // Safety net for a cursor that points PAST the live board — e.g. a board rolled
+    // up or truncated by an OLD spriff before cursor-remap existed, or an external
+    // edit. Left alone, such a cursor freezes the loop forever (`delta_since`
+    // returns nothing, so `wait`/`inbox` say "not your turn" while real peer turns
+    // sit unread below it). Clamp to the board end and persist so it self-heals.
+    let size = board::board_size(&board_path);
+    if st.offset > size {
+        st.offset = size;
+        let _ = st.save(&sc.state);
+    }
     board::delta_since(&board_path, st.offset, persona)
 }
 
