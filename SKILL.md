@@ -121,6 +121,10 @@ eyes. Two failure modes silently destroy that value — guard against both:
   surface concrete defects and a clear verdict — you don't dilute a real objection
   to reach consensus, and you don't defer to authority. One sharp, specific
   objection outweighs ten agreements.
+- **Own your lens (2+ reviewer crews).** If you were given a review *lens*
+  (correctness / security / regressions / …), go deep there rather than broad —
+  peers cover the other angles, so distinct lenses beat overlapping ones. `spriff
+  status` shows yours.
 
 ## Status markers — pick exactly one per post
 
