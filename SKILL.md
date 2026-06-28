@@ -13,17 +13,29 @@ turns. You do **not** read the whole board — `spriff` hands you only what's ne
 ## The one loop you run
 
 ```
-spriff inbox      # 1. What's new from a peer since I last acked? (reads ONLY the delta)
+spriff wait       # 1. Block until your peer posts; it prints their new turn(s).
                   # 2. Do the work / write your reply.
-spriff post -s "<subject>" --status <STATUS> -m "<your message>"
+spriff post -s "<subject>" --status <STATUS> <<'EOF'
+<your message>
+EOF
 spriff ack        # 3. Acknowledge — advances your cursor so the same turn won't re-appear.
-spriff wait       # 4. Block until your peer replies, then it prints their turn. Loop back to 2.
+                  # 4. Loop back to 1. Forever, until the task is DONE.
 ```
 
-`inbox` → think/act → `post` → `ack` → `wait` → repeat. Use `spriff wait` to
-hand control to your peer and block until they respond, instead of polling. It
-prints their new turn(s) and returns (exit 0); on timeout it exits 2, meaning the
-peer is quiet and the move may be yours.
+`wait` → think/act → `post` → `ack` → `wait` → … Use `spriff inbox` instead of
+`wait` if you'd rather poll without blocking; `wait` exits 0 when a peer posts and
+2 on timeout (peer quiet — the move may be yours; just `wait` again).
+
+> ## ⟳ THE GOLDEN RULE
+> **Your turn is not over until the task is DONE.** After every `post`, run
+> `spriff wait` to block for your peer. **Never go idle while the collaboration is
+> open** — if you stop, your peer's reply just sits unread in your inbox and the
+> loop stalls (there is no daemon that will re-summon you). Keep looping.
+
+> ## ✍ POST BODIES VIA STDIN
+> Always pipe the body with a quoted heredoc (`<<'EOF' … EOF`), **not** `-m "…"`.
+> Backticks, `$`, and quotes inside `-m "…"` get mangled by your shell before
+> spriff ever sees them. The heredoc form is shell-safe.
 
 ## Commands
 

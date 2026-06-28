@@ -511,29 +511,38 @@ fn cmd_join(
     println!("\n──────────────────────────── your first move ────────────────────────────");
     if is_impl {
         println!("1. Introduce yourself + declare the files you're touching:");
-        println!("     spriff post -s \"intro\" --status FYI -m \"<who you are + your plan>\"");
+        println!("     spriff post -s \"intro\" --status FYI <<'EOF'");
+        println!("     <who you are + your plan>");
+        println!("     EOF");
         println!(
             "     spriff touching <path> [<path>...]   # so your reviewer is woken on your edits"
         );
         println!("2. Implement a coherent chunk, then hand off for review:");
-        println!("     spriff post -s \"<what you did>\" --status NEEDS-REVIEW -m \"<summary + files/lines to scrutinize>\"");
-        println!("     spriff wait        # blocks until your reviewer replies");
+        println!("     spriff post -s \"<what you did>\" --status NEEDS-REVIEW <<'EOF'");
+        println!("     <summary + files/lines to scrutinize>");
+        println!("     EOF");
+        println!("3. spriff wait   → review their reply → respond → spriff wait → … until DONE.");
     } else {
-        println!("1. Introduce yourself, then start your continuous watcher (this IS your");
-        println!("   \"watch script\" — recursive + event-driven; do NOT hand-write one):");
+        println!("1. Introduce yourself:");
+        println!("     spriff post -s \"intro\" --status FYI <<'EOF'");
+        println!("     <who you are + your review bar>");
+        println!("     EOF");
         println!(
-            "     spriff post -s \"intro\" --status FYI -m \"<who you are + your review bar>\""
+            "2. Block until the implementer hands off, review the code they reference, reply:"
         );
-        println!(
-            "     spriff watch &     # wakes you on board posts AND the implementer's file edits"
-        );
-        println!("2. When the implementer hands off, review the code they reference, then:");
-        println!("     spriff post -s \"review: <area>\" --status NEEDS-REVIEW -m \"<file:line + the concrete issue>\"");
+        println!("     spriff wait");
+        println!("     spriff post -s \"review: <area>\" --status NEEDS-REVIEW <<'EOF'");
+        println!("     <file:line + the concrete issue, or LGTM with reasoning>");
+        println!("     EOF");
         println!("     spriff ack");
+        println!("3. spriff wait again → review next handoff → … until DONE.");
     }
-    println!("\nTip: `spriff watch &` in the background gives the tight feedback loop —");
-    println!("it's the recursive 'watch script', already built. Use `spriff wait` to block");
-    println!("for a single turn. Run `spriff skill` anytime to re-read the protocol.");
+    println!("\n⟳ THE GOLDEN RULE: your turn is NOT over until the task is DONE. After every");
+    println!("  post, run `spriff wait` to block for your peer — never go idle, or the loop");
+    println!("  stalls (your peer's reply will just sit unread in your inbox).");
+    println!("✍ Always pipe post bodies via stdin/heredoc (<<'EOF'), never -m \"…\" — backticks,");
+    println!("  $, and quotes in -m get mangled by the shell.");
+    println!("  Re-read the protocol anytime: spriff skill");
     Ok(())
 }
 
@@ -648,8 +657,16 @@ fn print_delta(turns: &[board::Turn]) {
         }
         println!("\n---");
     }
-    println!("\nRespond:  spriff post -s \"<subject>\" --status <STATUS> -m \"<reply>\"");
-    println!("Then:     spriff ack");
+    println!(
+        "\nRespond (pipe the body via stdin/heredoc — avoids shell-quoting on backticks/$/quotes):"
+    );
+    println!("    spriff post -s \"<subject>\" --status <STATUS> <<'EOF'");
+    println!("    <your reply>");
+    println!("    EOF");
+    println!("Ack:      spriff ack");
+    println!(
+        "Continue: spriff wait        # ⟳ STAY IN THE LOOP — do NOT stop until the work is DONE"
+    );
 }
 
 fn cmd_inbox(cfg: &Config, persona: &str) -> Result<()> {
