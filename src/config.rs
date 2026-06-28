@@ -37,6 +37,12 @@ pub struct Agent {
     /// Source paths owned by this agent, watched recursively by its peers.
     #[serde(default)]
     pub watchpaths: Vec<PathBuf>,
+    /// Model class driving this agent (e.g. "claude", "gpt", "gemini", "glm").
+    /// Optional and informational — used by `doctor` to flag a same-class pairing,
+    /// which forfeits most of the error-decorrelation gain heterogeneity buys. A
+    /// live `spriff join --class <x>` sidecar takes precedence over this seed.
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
