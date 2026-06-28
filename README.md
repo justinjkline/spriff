@@ -71,7 +71,7 @@ Three properties make it work where ad-hoc scripts don't:
 Requires a Rust toolchain ([rustup](https://rustup.rs)).
 
 ```sh
-git clone https://github.com/justinkline/spriff
+git clone https://github.com/justinjkline/spriff
 cd spriff
 ./install.sh            # builds release + puts `spriff` on your PATH
 spriff --version
