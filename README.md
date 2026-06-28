@@ -34,53 +34,51 @@ Different models bounce off each other and synergize: the executor's momentum, t
 reviewer's skepticism, each catching the other's misses. The result is
 higher-quality code than any one of them ships alone.
 
-## Why different model classes win — the evidence
+## Why different model classes win — and why that won't change
 
-The intuition above rests on a well-established result: **ensembling is close to a
-free lunch when the members' errors are uncorrelated — and errors decorrelate most
-when the models are genuinely different**, with different pretraining corpora,
-architectures, and alignment. A model's confident mistakes are correlated with its
-own training; a peer from a *different class* doesn't share those priors, so it
-catches what the first is systematically blind to. That is the classic
-ensemble-diversity principle — error decorrelation drives the gain — applied to
-frontier LLMs.
+This isn't a claim about today's frontier models. It's a property of *combining
+diverse predictors* — established long before language models, and independent of
+which model happens to lead this year.
 
-The empirical thread runs from weak to strong forms of diversity:
+- **Condorcet's jury theorem (1785).** If each decider is *independent* and even
+  slightly better than a coin flip, a majority of them is more likely correct than
+  any single one — and the advantage grows with the group.
+  ([overview](https://en.wikipedia.org/wiki/Condorcet%27s_jury_theorem))
+- **The ambiguity decomposition (Krogh & Vedelsby, 1995).** For a combined
+  estimator, *ensemble error = average member error − their diversity*. You can
+  never do worse than the average member, and every unit of **diversity** subtracts
+  directly from the error. Diversity isn't a bonus; it's the term that buys the
+  accuracy.
 
-- **Diversity within a single model already helps.** Sampling multiple reasoning
-  paths and taking the consensus — *self-consistency* — lifts accuracy
-  substantially (e.g. **+17.9%** on GSM8K).
-  [Wang et al., 2022](https://arxiv.org/abs/2203.11171)
-- **Multiple instances debating beat one.** Several model instances proposing and
-  critiquing over rounds improve factuality and reasoning and cut hallucination.
-  [Du et al., 2023](https://arxiv.org/abs/2305.14325)
-- **The best model differs per problem.** Ensembling diverse LLMs via ranking and
-  fusion beats any single one, precisely because "the optimal LLM can vary
-  significantly per example."
-  [LLM-Blender — Jiang et al., 2023](https://arxiv.org/abs/2306.02561)
-- **A mix of lesser models can beat a bigger single one.** A layered
-  *Mixture-of-Agents* of open models scored **65.1%** on AlpacaEval 2.0,
-  **surpassing GPT-4 Omni's 57.5%** — combination beating a single frontier model.
-  [Wang et al., 2024](https://arxiv.org/abs/2406.04692)
-- **The idea is moving into code.** Ensemble methods are now actively studied for
-  code generation and repair specifically — with both promising results and honest
-  caveats.
-  [Survey — Ashiga et al., 2025](https://arxiv.org/abs/2503.13505) ·
-  [Wisdom and Delusion of LLM Ensembles for Code, 2025](https://arxiv.org/abs/2510.21513)
+This is the same mathematics behind bagging, random forests, and the centuries-old
+"wisdom of crowds" (Galton, 1907). It's a theorem, not a benchmark — it doesn't
+expire when the next model ships.
 
-**Where spriff is different.** Most of that work ensembles *outputs* — sample,
-rank, vote, or fuse after the fact — or runs symmetric debate. spriff applies the
-same diversity principle to *agentic coding*, as a tight, role-asymmetric
-**execute↔review loop** between different model classes: the reviewer's different
-priors catch the implementer's blind spots **in flight**, turn by turn, and the
-loop runs to a real Definition of Done rather than a single shot.
+**The load-bearing word in both results is *independence*.** Identical voters add
+nothing — correlated errors don't cancel. Two runs of the *same* model are nearly
+the same voter: confidently wrong in the same places, because one training process
+shaped both the skill and the blind spot. The least-correlated voters you can
+actually pair are frontier models from **different classes** — different training
+data, architectures, and alignment, and therefore different failure modes. That is
+exactly the regime where the theory predicts the largest gain — and it doesn't
+erode as models improve: better-but-still-different voters only raise the combined
+ceiling.
 
-**We intend to measure this, not just assert it.** spriff is being evaluated on
-**[SWE-Bench Pro](https://github.com/scaleapi/SWE-bench_Pro-os)** (real GitHub
-issues, hidden test suites) under a controlled design — **Claude Opus 4.8 ⇄
-GPT-5.5** against each model solo *and* a same-model loop — so any lift is
-attributable to *heterogeneity* rather than extra compute alone. Results will be
-published here. If the data disagrees, that goes here too.
+The effect keeps re-appearing in language models specifically — multi-agent debate
+([Du et al., 2023](https://arxiv.org/abs/2305.14325)), output ensembling
+([Jiang et al., 2023](https://arxiv.org/abs/2306.02561)), and mixtures of models
+([Wang et al., 2024](https://arxiv.org/abs/2406.04692)) each beat their strongest
+single member. New medium, same enduring principle.
+
+**Where spriff is different.** Most of that work combines *outputs* — sample, rank,
+vote, or fuse after the fact — or runs symmetric debate. spriff applies the same
+principle to *agentic coding*, as a tight, role-asymmetric **execute↔review loop**
+between different model classes: the reviewer's decorrelated errors catch the
+implementer's blind spots **in flight**, turn by turn, and the loop runs to a real
+Definition of Done rather than a single shot.
+
+The specific models will keep changing. The reason a heterogeneous crew beats any
+one of them will not.
 
 ## How it works
 
