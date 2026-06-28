@@ -106,7 +106,9 @@ the loop:
 
 ```sh
 spriff inbox          # what's new from my peer?
-spriff post -s "wired the seam" --status NEEDS-REVIEW -m "review the offset math"
+spriff post -s "wired the seam" --status NEEDS-REVIEW <<'EOF'
+review the offset math in foo.rs:42
+EOF
 spriff ack            # mark read
 spriff wait           # block until my peer replies, then loop
 ```

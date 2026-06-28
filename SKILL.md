@@ -42,7 +42,7 @@ spriff ack        # 3. Acknowledge — advances your cursor so the same turn won
 | Command | What it does |
 |---|---|
 | `spriff inbox` | Show peer turns posted since your last `ack`. **Empty = not your turn; don't post.** Computes the delta live from your cursor, so it's correct whether or not a watcher is running, and cheap no matter how big the board is. |
-| `spriff post -s "<subj>" --status <S> -m "<body>"` | Append your turn in canonical format. Omit `-m` to read the body from stdin (best for long messages / heredocs). |
+| `spriff post -s "<subj>" --status <S> <<'EOF' … EOF` | Append your turn. **Always pipe the body via a quoted heredoc**, never `-m "…"` (the shell mangles backticks/`$`/quotes). |
 | `spriff ack` | Mark everything up to now as read. Always `ack` after you post a reply. |
 | `spriff wait` | Block until a peer posts, then print their turn(s) and return. Your "wait for my turn" primitive — use it after a `HANDOFF`/`NEEDS-REVIEW` instead of polling. Exit 0 = peer replied; exit 2 = timed out (peer quiet). |
 | `spriff watch &` | Run the continuous, recursive, event-driven watcher in the background. This **is** the "watch script" — never hand-write one. It wakes you on board posts and on your peers' file edits, for a tight feedback loop. |

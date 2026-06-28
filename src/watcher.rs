@@ -25,8 +25,9 @@ use crate::pending;
 use crate::state::WatchState;
 use crate::util::utc_now;
 use anyhow::Result;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -56,49 +57,53 @@ pub fn run(cfg: &Config, persona: &str) -> Result<()> {
     if let Some(parent) = board_path.parent() {
         let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
     }
-    // ... plus every peer source path, recursively. Sources come from two places:
-    // the config (`watchpaths` per agent) and each peer's live `.watchpaths`
-    // sidecar declared via `spriff touching`.
-    let mut sources = cfg.peer_watchpaths(persona);
-    for peer in cfg.peers(persona) {
-        let peer_sc = Sidecars::derive(&board_path, &peer);
-        sources.extend(crate::paths::read_watchpaths(&peer_sc.watchpaths));
-    }
-    for p in sources {
-        if p.exists() {
-            let _ = watcher.watch(&p, RecursiveMode::Recursive);
-        }
-    }
+    // Peer source paths are reconciled DYNAMICALLY (see reconcile_sources): an
+    // implementer can `spriff touching <path>` AFTER the reviewer started watching
+    // and the running watcher picks it up — and a not-yet-created path is covered
+    // by watching its nearest existing ancestor.
+    let mut watched_sources: HashSet<PathBuf> = HashSet::new();
+    reconcile_sources(
+        &mut watcher,
+        &mut watched_sources,
+        cfg,
+        persona,
+        &board_path,
+    );
 
     log(
         &sc.log,
         &format!(
-            "armed persona={persona} board={} offset={} settle_ms={} poll_ms={} peers={}",
+            "armed persona={persona} board={} offset={} settle_ms={} poll_ms={} peers={} watched_sources={}",
             board_path.display(),
             st.offset,
             cfg.watch.settle_ms,
             cfg.watch.poll_ms,
-            cfg.peers(persona).len()
+            cfg.peers(persona).len(),
+            watched_sources.len()
         ),
     );
     eprintln!(
-        "[spriff] watching {} as {persona} (offset {})",
+        "[spriff] watching {} as {persona} (offset {}, {} source path(s))",
         board_path.display(),
-        st.offset
+        st.offset,
+        watched_sources.len()
     );
 
     let settle = Duration::from_millis(cfg.watch.settle_ms);
     let poll = Duration::from_millis(cfg.watch.poll_ms);
+    // Coalesce the low-key workspace-changed notice so a burst of saves is one line.
+    let mut last_workspace_notice = Instant::now() - Duration::from_secs(3600);
 
     loop {
         // Block until a real FS event OR the safety-poll timeout. Either way we
         // proceed to (settle, then) process — the timeout is the periodic safety
         // re-check that guarantees a dropped event can't strand a pending post.
-        match rx.recv_timeout(poll) {
-            Ok(_event) => {}
-            Err(RecvTimeoutError::Timeout) => {}
+        let mut workspace_hit: Option<PathBuf> = match rx.recv_timeout(poll) {
+            Ok(Ok(ev)) => source_hit(&ev, &board_path, &watched_sources),
+            Ok(Err(_)) => None,
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
-        }
+        };
 
         // Settle: wait for the filesystem to go quiet for `settle`, draining any
         // events that arrive during the nap so a burst coalesces into ONE wake.
@@ -106,13 +111,54 @@ pub fn run(cfg: &Config, persona: &str) -> Result<()> {
         let mut last_event = Instant::now();
         while last_event.elapsed() < settle {
             std::thread::sleep(settle.saturating_sub(last_event.elapsed()));
-            while rx.try_recv().is_ok() {
+            while let Ok(res) = rx.try_recv() {
                 last_event = Instant::now();
+                if workspace_hit.is_none() {
+                    if let Ok(ev) = res {
+                        workspace_hit = source_hit(&ev, &board_path, &watched_sources);
+                    }
+                }
             }
         }
 
-        if let Err(e) = process_board(persona, &sc) {
-            log(&sc.log, &format!("ERROR processing board: {e}"));
+        // Pick up any newly-declared peer paths (the bug Alice caught: paths were
+        // only read once at startup). Cheap; runs every settle.
+        let added = reconcile_sources(
+            &mut watcher,
+            &mut watched_sources,
+            cfg,
+            persona,
+            &board_path,
+        );
+        if added > 0 {
+            let msg = format!(
+                "registered {added} new source path(s); now watching {}",
+                watched_sources.len()
+            );
+            log(&sc.log, &msg);
+            eprintln!("[spriff] {msg}");
+        }
+
+        let raised = match process_board(persona, &sc) {
+            Ok(r) => r,
+            Err(e) => {
+                log(&sc.log, &format!("ERROR processing board: {e}"));
+                false
+            }
+        };
+
+        // Workspace-changed: a LOW-KEY, non-escalating notice that a peer edited a
+        // watched file (not a board post). The board stays the only actionable
+        // handoff signal; this just keeps the promise that `watch` reports edits.
+        if !raised {
+            if let Some(path) = workspace_hit {
+                if last_workspace_notice.elapsed() >= Duration::from_secs(2) {
+                    let msg = format!("peer workspace changed: {}", path.display());
+                    log(&sc.log, &msg);
+                    eprintln!("[spriff] {msg} (no board post yet)");
+                    last_workspace_notice = Instant::now();
+                }
+            }
         }
     }
 
@@ -126,7 +172,8 @@ pub fn run(cfg: &Config, persona: &str) -> Result<()> {
 /// peer post (only `ack` consumes); it just raises the proactive signal. This is
 /// what decouples correctness from watcher timing — `inbox` recomputes the same
 /// delta live, so collaboration works even with no watcher running.
-pub fn process_board(persona: &str, sc: &Sidecars) -> Result<()> {
+/// Returns `true` if it raised a (new) pending signal this pass.
+pub fn process_board(persona: &str, sc: &Sidecars) -> Result<bool> {
     let board_path = &sc.board;
     let mut st = WatchState::load(&sc.state);
     let size = board::board_size(board_path);
@@ -136,7 +183,7 @@ pub fn process_board(persona: &str, sc: &Sidecars) -> Result<()> {
         st.offset = size;
         st.save(&sc.state)?;
         log(&sc.log, &format!("board shrank to {size}; cursor clamped"));
-        return Ok(());
+        return Ok(false);
     }
 
     // Capture only peer turns since the cursor. `delta_since` already excludes
@@ -144,13 +191,13 @@ pub fn process_board(persona: &str, sc: &Sidecars) -> Result<()> {
     // (which could otherwise skip an unread peer turn posted just before ours).
     let turns = board::delta_since(board_path, st.offset, persona)?;
     if turns.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     // Dedup: same newest header already flagged and still pending -> don't spam.
     let latest_header = turns.last().map(|t| t.header()).unwrap_or_default();
     if latest_header == st.last_pending_header && pending::is_raised(sc) {
-        return Ok(());
+        return Ok(false);
     }
 
     // Escalate loudly when any captured turn carries an action-demanding status.
@@ -178,7 +225,72 @@ pub fn process_board(persona: &str, sc: &Sidecars) -> Result<()> {
         sc.flag.display(),
         turns.len()
     );
-    Ok(())
+    Ok(true)
+}
+
+/// Reconcile the set of watched peer source paths against config + live
+/// `.watchpaths` sidecars, adding any not already watched. A path that doesn't
+/// exist yet is covered by watching its nearest existing ancestor, so the file's
+/// later creation still fires an event. Returns how many roots were newly added.
+fn reconcile_sources(
+    watcher: &mut RecommendedWatcher,
+    watched: &mut HashSet<PathBuf>,
+    cfg: &Config,
+    persona: &str,
+    board_path: &Path,
+) -> usize {
+    let mut desired = cfg.peer_watchpaths(persona);
+    for peer in cfg.peers(persona) {
+        let peer_sc = Sidecars::derive(board_path, &peer);
+        desired.extend(crate::paths::read_watchpaths(&peer_sc.watchpaths));
+    }
+    let mut added = 0;
+    for p in desired {
+        if let Some(target) = nearest_existing(&p) {
+            // Store the CANONICAL path so it compares equal to FSEvents paths,
+            // which resolve symlinks (e.g. macOS /var -> /private/var).
+            let target = canon(&target);
+            if watched.insert(target.clone())
+                && watcher.watch(&target, RecursiveMode::Recursive).is_ok()
+            {
+                added += 1;
+            }
+        }
+    }
+    added
+}
+
+/// Canonicalize a path, falling back to the input if it can't be resolved.
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// The path itself if it exists, else the closest existing ancestor directory.
+fn nearest_existing(p: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(p);
+    while let Some(c) = cur {
+        if c.exists() {
+            return Some(c.to_path_buf());
+        }
+        cur = c.parent();
+    }
+    None
+}
+
+/// If an FS event touched a watched source path (and not the board file), return
+/// that path — used for the low-key workspace-changed notice.
+fn source_hit(ev: &Event, board: &Path, watched: &HashSet<PathBuf>) -> Option<PathBuf> {
+    let board_c = canon(board);
+    for p in &ev.paths {
+        let pc = canon(p);
+        if pc == board_c {
+            continue;
+        }
+        if watched.iter().any(|root| pc.starts_with(root)) {
+            return Some(pc);
+        }
+    }
+    None
 }
 
 fn log(path: &Path, msg: &str) {

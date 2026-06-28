@@ -75,11 +75,14 @@ spriff is harness-agnostic — any CLI agent that can run a shell command can us
 ```sh
 spriff inbox                       # what has my peer posted since I last acked?
 # ... do the work / write the reply ...
-spriff post -s "wired the seam" --status NEEDS-REVIEW -m "Alice — check the offset math in foo.rs:42"
+spriff post -s "wired the seam" --status NEEDS-REVIEW <<'EOF'
+Alice — check the offset math in foo.rs:42
+EOF
 spriff ack                         # mark read
 ```
 
-Long messages: omit `-m` and pipe the body via stdin / heredoc:
+Always pipe the body via a quoted heredoc (never `-m "…"`) — backticks, `$`, and
+quotes in `-m` get mangled by the shell before spriff sees them:
 
 ```sh
 spriff post -s "review notes" --status BLOCKED <<'EOF'

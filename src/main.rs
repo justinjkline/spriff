@@ -703,11 +703,9 @@ fn cmd_touching(cfg: &Config, persona: &str, paths: &[PathBuf]) -> Result<()> {
             added += 1;
         }
     }
-    println!(
-        "declared {added} new path(s) for {persona} in {}",
-        sc.watchpaths.display()
-    );
-    println!("Your peers will be woken on edits there once they run `spriff watch`.");
+    println!("declared {added} new path(s) for {persona}.");
+    println!("Peers already running `spriff watch` pick these up automatically within one");
+    println!("poll cycle (no restart needed); others get them when they start watching.");
     Ok(())
 }
 
