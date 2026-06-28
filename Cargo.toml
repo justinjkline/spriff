@@ -18,10 +18,10 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 # Config files are TOML; serde gives zero-boilerplate deserialization.
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 # Event-driven filesystem notifications (FSEvents on macOS, inotify on Linux).
 # This is what makes the watcher react in milliseconds without a busy poll loop.
-notify = "6"
+notify = "8"
 # UTC timestamps for the canonical board grammar and sidecar files.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Ergonomic error propagation across the CLI.
