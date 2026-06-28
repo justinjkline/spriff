@@ -537,6 +537,21 @@ fn mission_eq(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
+/// The exact command a peer runs to land on THIS same board — PURE, so the
+/// rendezvous-key logic is unit-tested. The KEY is the slug: when `--collab` was
+/// explicit the goal text would slugify to a *different* board, so the peer
+/// command must carry `--collab {name}` (the goal rides along only as shared
+/// context); otherwise the goal text itself slugifies back to `{name}` and is the
+/// key. (Alice's escape-hatch sync catch — a peer command that points elsewhere
+/// silently breaks the whole prompt-native rendezvous.)
+fn peer_join_command(other_role: &str, name: &str, project: &str, collab_explicit: bool) -> String {
+    if collab_explicit {
+        format!("spriff join --role {other_role} --collab {name} --project \"{project}\"")
+    } else {
+        format!("spriff join --role {other_role} --project \"{project}\"")
+    }
+}
+
 /// What `join --project` should do with the mission once it has resolved a board.
 #[derive(Debug, PartialEq, Eq)]
 enum MissionPlan {
@@ -966,7 +981,23 @@ fn cmd_join(
             }
         );
         println!("  → Your peer joins the SAME board with:");
-        println!("      spriff join --role {other_role} --project \"{p}\"");
+        println!(
+            "      {}",
+            peer_join_command(other_role, &name, p, collab_explicit)
+        );
+        // In the --collab override case the goal text is only a label, so if it
+        // disagrees with this board's mission, say so loudly — the rendezvous key
+        // is the explicit slug, not the text. (Alice's escape-hatch catch.)
+        if collab_explicit {
+            if let Some(m) = read_mission(&cfg.board_path()) {
+                if !mission_eq(&m, p) {
+                    println!(
+                        "  ⚠ this board's mission is \"{m}\" — your --project \"{p}\" is just a \
+                         label here; the rendezvous key is --collab {name}."
+                    );
+                }
+            }
+        }
     }
     println!(
         "  Your peer(s): {}",
@@ -1682,6 +1713,28 @@ mod tests {
         // (`a-b`) but mean different things must NOT be treated as the same goal.
         assert_eq!(slugify("a/b"), slugify("a b")); // same board…
         assert!(!mission_eq("a/b", "a b")); // …different goal.
+    }
+
+    #[test]
+    fn peer_join_command_uses_the_real_rendezvous_key() {
+        // --project was the key: the peer passes the same --project (slugifies
+        // back to the same board) and must NOT be handed --collab.
+        let c = peer_join_command("reviewer", "fix-checkout", "fix checkout", false);
+        assert_eq!(c, "spriff join --role reviewer --project \"fix checkout\"");
+        // --collab forced the slug: the goal text would slugify ELSEWHERE, so the
+        // peer command MUST carry --collab to land on this board (Alice's catch).
+        let c = peer_join_command("implementer", "a-b", "totally different", true);
+        assert!(c.contains("--collab a-b"));
+        assert_eq!(
+            c,
+            "spriff join --role implementer --collab a-b --project \"totally different\""
+        );
+        // The bug regression guard: the override command must NOT be the bare
+        // --project form that points the peer at a different board.
+        assert_ne!(
+            c,
+            "spriff join --role implementer --project \"totally different\""
+        );
     }
 
     #[test]
