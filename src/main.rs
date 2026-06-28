@@ -28,6 +28,11 @@ use std::time::{Duration, Instant};
 /// every CLI agent (Claude, Codex, …). No copy-pasted, drifting preambles.
 const SKILL: &str = include_str!("../SKILL.md");
 
+/// The always-on bar for declaring a collaboration's work DONE. Injected into the
+/// supervisor's wake prompts and documented in SKILL.md so the crew keeps the
+/// implement↔review loop going until the work is genuinely shipped.
+const DEFINITION_OF_DONE: &str = "feature-complete, fully unit-tested, live-integration-tested, and PR'd (a pull request is open and CI is green)";
+
 #[derive(Parser)]
 #[command(
     name = "spriff",
@@ -230,6 +235,19 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+
+    /// Set or show the collaboration's MISSION — the specific goal the crew drives
+    /// to completion. Combined with the always-on Definition of Done (feature
+    /// complete · fully tested · live-integration tested · PR'd), it keeps the
+    /// implement↔review loop going until the work is genuinely shipped.
+    Mission {
+        /// The mission text. Omit to show the current mission.
+        text: Vec<String>,
+        #[arg(long)]
+        collab: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -273,7 +291,7 @@ fn main() -> Result<()> {
             no_kickoff,
             agent_cmd,
         } => {
-            let (cfg, name) = resolve(collab, config)?;
+            let (cfg, name) = resolve(collab, config.clone())?;
             let persona = resolve_persona(as_persona, &cfg);
             cmd_serve(
                 &cfg,
@@ -283,6 +301,7 @@ fn main() -> Result<()> {
                 poll,
                 !no_kickoff,
                 &agent_cmd,
+                config,
             )
         }
         Cmd::Post {
@@ -374,12 +393,67 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Mission {
+            text,
+            collab,
+            config,
+        } => {
+            let (cfg, _name) = resolve(collab, config)?;
+            let path = mission_path(&cfg.board_path());
+            if text.is_empty() {
+                match read_mission(&cfg.board_path()) {
+                    Some(m) => {
+                        println!("Mission:\n{m}\n");
+                        println!("Definition of Done (always on): {DEFINITION_OF_DONE}");
+                    }
+                    None => println!(
+                        "No mission set. Set one: spriff mission \"<goal>\".\nDefinition of Done (always on): {DEFINITION_OF_DONE}"
+                    ),
+                }
+            } else {
+                std::fs::write(&path, format!("{}\n", text.join(" ")))?;
+                println!("Mission set ({}).", path.display());
+                println!("The crew will drive to completion against it + the Definition of Done.");
+            }
+            Ok(())
+        }
     }
+}
+
+/// The shared mission file for a board: `<board-base>.mission.md`.
+fn mission_path(board: &std::path::Path) -> PathBuf {
+    let dir = board.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut base = board
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "board".into());
+    if let Some(s) = base.strip_suffix(".md") {
+        base = s.to_string();
+    }
+    if let Some(s) = base.strip_suffix(".board") {
+        base = s.to_string();
+    }
+    dir.join(format!("{base}.mission.md"))
+}
+
+fn read_mission(board: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(mission_path(board)).ok()?;
+    let t = text.trim();
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// Resolve (config, name) from optional flags, honouring the registry priority
 /// order. An explicit `--config <path>` short-circuits name resolution.
 fn resolve(collab: Option<String>, config: Option<PathBuf>) -> Result<(Config, String)> {
+    // An explicit --config short-circuits; so does $SPRIFF_CONFIG, which is how a
+    // `spriff serve --config <path>` supervisor propagates a non-registry config
+    // to its supervised child's bare `spriff` commands.
+    let config = config.or_else(|| {
+        std::env::var("SPRIFF_CONFIG")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
     if let Some(path) = config {
         let cfg = Config::load(&path)?;
         let name = path
@@ -830,6 +904,7 @@ fn cmd_wait(cfg: &Config, persona: &str, timeout_secs: u64, interval_secs: u64) 
 /// just re-spawned on the next peer turn. The agent does ONE turn and exits; we
 /// dedup on the latest peer header so an agent that forgets to `ack` is not
 /// re-invoked in a spin.
+#[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     cfg: &Config,
     name: &str,
@@ -838,6 +913,7 @@ fn cmd_serve(
     poll: u64,
     kickoff: bool,
     agent_cmd: &[String],
+    config: Option<PathBuf>,
 ) -> Result<()> {
     // Identity validation at the persistent entry point: refuse to supervise an
     // off-roster persona (it would act as someone the collaboration doesn't know).
@@ -853,20 +929,26 @@ fn cmd_serve(
         );
     }
 
-    let board_path = cfg.board_path();
-    let sc = Sidecars::derive(&board_path, persona);
     let interval = Duration::from_secs(poll.max(1));
     const MAX_ATTEMPTS: u32 = 3;
+    let mission = read_mission(&cfg.board_path());
     eprintln!(
-        "[spriff] serving {persona} on '{name}': invoking `{}` per peer turn (poll {poll}s, idle_timeout {idle_timeout}s)",
-        agent_cmd.join(" ")
+        "[spriff] serving {persona} on '{name}': invoking `{}` per peer turn (poll {poll}s, idle_timeout {idle_timeout}s){}",
+        agent_cmd.join(" "),
+        if mission.is_some() { " [drive-to-completion mission set]" } else { "" }
     );
 
     // Kickoff: an opening invocation so an implementer can LEAD and a reviewer can
     // catch up on anything already waiting. Completion is judged below, not here.
     if kickoff {
         eprintln!("[spriff] kickoff invocation…");
-        run_agent(agent_cmd, name, persona, &kickoff_prompt(name, persona));
+        run_agent(
+            agent_cmd,
+            name,
+            persona,
+            config.as_deref(),
+            &kickoff_prompt(name, persona, mission.as_deref()),
+        );
     }
 
     let mut idle_since = Instant::now();
@@ -907,7 +989,8 @@ fn cmd_serve(
             agent_cmd,
             name,
             persona,
-            &wake_prompt(name, persona, turns.len()),
+            config.as_deref(),
+            &wake_prompt(name, persona, turns.len(), mission.as_deref()),
         );
 
         // COMPLETION POLICY (not "did the process exit 0"): did the turn actually
@@ -921,26 +1004,14 @@ fn cmd_serve(
             attempts = 0;
             continue;
         }
-        // Safety net: the agent replied but forgot to `ack` (the latest board turn
-        // is now ours). Advance the cursor on its behalf so we don't re-invoke and
-        // double-post.
-        let i_replied = board::last_turn_header(&board_path)
-            .map(|(_, author, _)| author.eq_ignore_ascii_case(persona))
-            .unwrap_or(false);
-        if i_replied {
-            let mut st = state::WatchState::load(&sc.state);
-            st.offset = board::board_size(&board_path);
-            st.last_pending_header = String::new();
-            st.save(&sc.state)?;
-            pending::ack(&sc).ok();
-            eprintln!("[spriff] agent replied without ack; cursor advanced on its behalf.");
-            idle_since = Instant::now();
-            current_header.clear();
-            attempts = 0;
-            continue;
-        }
-        // Genuinely unhandled (no reply): retry with linear backoff.
-        eprintln!("[spriff] turn still unhandled (attempt {attempts}); retrying after backoff.");
+        // NOT consumed. We deliberately do NOT auto-ack on "the latest board post
+        // is mine" — that heuristic can't distinguish a real, complete reply from a
+        // progress note, a partial/failure post, or an intro, so it would silently
+        // consume an unaddressed turn and HIDE work. (Alice's catch.) Instead we
+        // retry with loud linear backoff; the wake prompt requires the agent to run
+        // `spriff ack` only when it genuinely handled the turn, which is the single
+        // authoritative completion signal.
+        eprintln!("[spriff] turn not acked (attempt {attempts}); retrying after backoff.");
         std::thread::sleep(interval * attempts);
     }
 }
@@ -949,18 +1020,28 @@ fn cmd_serve(
 /// and exporting the agent's identity (SPRIFF_COLLAB/SPRIFF_AS) so its `spriff`
 /// commands resolve correctly regardless of the child's working directory.
 /// Inherits stdio so the operator sees the agent work. Returns process success.
-fn run_agent(agent_cmd: &[String], name: &str, persona: &str, prompt: &str) -> bool {
+fn run_agent(
+    agent_cmd: &[String],
+    name: &str,
+    persona: &str,
+    config: Option<&std::path::Path>,
+    prompt: &str,
+) -> bool {
     let Some((prog, args)) = agent_cmd.split_first() else {
         eprintln!("[spriff] empty agent command");
         return false;
     };
-    match std::process::Command::new(prog)
-        .args(args)
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args)
         .arg(prompt)
         .env("SPRIFF_COLLAB", name)
-        .env("SPRIFF_AS", persona)
-        .status()
-    {
+        .env("SPRIFF_AS", persona);
+    // Propagate an explicit --config so the child's bare `spriff` commands resolve
+    // the same non-registry config (Alice's catch: child only got SPRIFF_COLLAB).
+    if let Some(path) = config {
+        cmd.env("SPRIFF_CONFIG", path);
+    }
+    match cmd.status() {
         Ok(s) if s.success() => true,
         Ok(s) => {
             eprintln!("[spriff] agent exited with {s}");
@@ -973,7 +1054,22 @@ fn run_agent(agent_cmd: &[String], name: &str, persona: &str, prompt: &str) -> b
     }
 }
 
-fn wake_prompt(name: &str, persona: &str, n: usize) -> String {
+/// The drive-to-completion clause shared by both supervisor prompts: the
+/// always-on Definition of Done plus the collaboration's specific mission.
+fn completion_clause(mission: Option<&str>) -> String {
+    let m = match mission {
+        Some(m) => format!(" MISSION: {m}."),
+        None => String::new(),
+    };
+    format!(
+        " This is a DRIVE-TO-COMPLETION collaboration: do NOT declare the work DONE (--status \
+         DONE) until it is {DEFINITION_OF_DONE}. As reviewer, REJECT a premature DONE and name \
+         the precise gap; as implementer, keep closing gaps. Keep the implement<->review loop \
+         going until every part is genuinely shipped.{m}"
+    )
+}
+
+fn wake_prompt(name: &str, persona: &str, n: usize, mission: Option<&str>) -> String {
     format!(
         "You are {persona}, an agent on the spriff collaboration '{name}'. {n} new peer \
          turn(s) are waiting. Do exactly ONE turn, then EXIT — do NOT run `spriff wait` or \
@@ -981,18 +1077,19 @@ fn wake_prompt(name: &str, persona: &str, n: usize) -> String {
          posts, so idling only wastes tokens (any 'stay in the loop / spriff wait' note from \
          `spriff skill` does NOT apply while supervised). The turn: run `spriff inbox` to read \
          the new turn(s), do the work, post your reply with `spriff post -s \"...\" --status \
-         <STATUS>` (body via a quoted heredoc, never -m \"...\"), then `spriff ack`. Use \
-         --status DONE if the task is fully complete. Then exit."
+         <STATUS>` (body via a quoted heredoc, never -m \"...\"), then `spriff ack`.{}",
+        completion_clause(mission)
     )
 }
 
-fn kickoff_prompt(name: &str, persona: &str) -> String {
+fn kickoff_prompt(name: &str, persona: &str, mission: Option<&str>) -> String {
     format!(
         "You are {persona}, an agent on the spriff collaboration '{name}'. Assess with `spriff \
          status` and `spriff inbox`. If a peer turn is waiting, handle it (read, work, `spriff \
          post`, `spriff ack`). If you are the implementer and nothing is waiting, make the \
          opening move (post your intro/plan). Do exactly ONE turn, then EXIT — do NOT run \
-         `spriff wait`; the supervisor re-invokes you when your peer posts."
+         `spriff wait`; the supervisor re-invokes you when your peer posts.{}",
+        completion_clause(mission)
     )
 }
 

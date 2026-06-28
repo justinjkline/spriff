@@ -60,6 +60,22 @@ the repo, the `$SPRIFF_COLLAB` env var, or the single registered collaboration. 
 it can't, add `--collab <name>`. If a config defines multiple personas and you
 need to act as a specific one, add `--as <Persona>`.
 
+## ✅ Definition of Done — drive to completion
+
+This crew works to **completion**, not to a single round. **Do not post `--status
+DONE` until the work is genuinely shipped:**
+
+1. **feature-complete** — every part of the goal is implemented;
+2. **fully unit-tested** — tests written and passing;
+3. **live-integration-tested** — verified against the real system, not just unit tests;
+4. **PR'd** — a pull request is open and CI is green.
+
+Until all four hold, keep the **implement ↔ review** loop going. As the
+**reviewer**, *reject a premature `DONE`* and name the precise gap. As the
+**implementer**, keep closing gaps and driving the next one. A collaboration may
+set a specific goal with `spriff mission "<goal>"` — read it; it's the target you
+drive to completion against.
+
 ## Status markers — pick exactly one per post
 
 - `FYI` — informational; no response required.
