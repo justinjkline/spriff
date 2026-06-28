@@ -75,6 +75,19 @@ enum Cmd {
         agents: usize,
     },
 
+    /// Show which persona/collaboration your bare commands resolve to AND where
+    /// that identity came from. Run this if `spriff inbox`/`wait` seems to show
+    /// the wrong thing — a stale/foreign `.spriff` marker can make you act as the
+    /// wrong persona (and then your peer's posts get filtered out as "your own").
+    Whoami {
+        #[arg(long)]
+        collab: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long = "as")]
+        as_persona: Option<String>,
+    },
+
     /// Print the agent collaboration protocol (the SKILL file). Point any CLI
     /// agent at `spriff skill` to onboard it.
     Skill,
@@ -261,6 +274,46 @@ fn main() -> Result<()> {
             repo,
             agents,
         } => cmd_join(&role, as_name, with, collab, repo, agents),
+        Cmd::Whoami {
+            collab,
+            config,
+            as_persona,
+        } => {
+            let (cfg, name) = resolve(collab, config)?;
+            let (persona, source) = resolve_persona_with_source(as_persona, &cfg);
+            let role = cfg.role_of(&persona);
+            let on_roster = cfg
+                .agents
+                .iter()
+                .any(|a| a.persona.eq_ignore_ascii_case(&persona));
+            println!("collaboration: {name}");
+            println!(
+                "persona:       {persona}{}",
+                match &role {
+                    Some(r) => format!(" ({r})"),
+                    None => String::new(),
+                }
+            );
+            println!("identity from: {source}");
+            println!(
+                "roster:        [{}]",
+                cfg.agents
+                    .iter()
+                    .map(|a| a.persona.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !on_roster {
+                println!(
+                    "⚠  WARNING: '{persona}' is NOT on the roster — your peer's posts will look"
+                );
+                println!(
+                    "   wrong/empty. Set the right identity with `--as <name>` or $SPRIFF_AS,"
+                );
+                println!("   or run under `spriff serve --as <name>` (which forces it).");
+            }
+            Ok(())
+        }
         Cmd::Skill => {
             print!("{SKILL}");
             Ok(())
@@ -544,22 +597,31 @@ fn cmd_init(
     Ok(())
 }
 
-/// The persona to act as: `--as` flag → `$SPRIFF_AS` → `.spriff` marker `as=` →
-/// the collaboration's executor. `spriff join` writes the marker, so after
-/// joining an agent's bare commands act as the right persona automatically.
-fn resolve_persona(explicit: Option<String>, cfg: &Config) -> String {
+/// The persona to act as, plus a human description of WHERE that identity came
+/// from: `--as` flag → `$SPRIFF_AS` → `.spriff` marker `as=` → the executor.
+/// The source matters because a stale/foreign marker can silently make an agent
+/// act as the wrong persona (e.g. a reviewer resolving as the executor because a
+/// shared repo's marker names someone else) — `spriff whoami` surfaces it.
+fn resolve_persona_with_source(explicit: Option<String>, cfg: &Config) -> (String, String) {
     if let Some(p) = explicit {
-        return p;
+        return (p, "--as flag".to_string());
     }
     if let Ok(p) = std::env::var("SPRIFF_AS") {
         if !p.is_empty() {
-            return p;
+            return (p, "$SPRIFF_AS env".to_string());
         }
     }
     if let Some(p) = registry::marker_field("as") {
-        return p;
+        return (p, ".spriff marker (walked up from cwd)".to_string());
     }
-    cfg.default_persona()
+    (
+        cfg.default_persona(),
+        "default = the collaboration's executor (no --as/env/marker found)".to_string(),
+    )
+}
+
+fn resolve_persona(explicit: Option<String>, cfg: &Config) -> String {
+    resolve_persona_with_source(explicit, cfg).0
 }
 
 /// Onboard an agent: auto-create/join the collaboration, claim the role's
