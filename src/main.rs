@@ -21,6 +21,7 @@ use config::Config;
 use paths::Sidecars;
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// The agent-facing protocol, embedded so `spriff skill` is always in sync
 /// with the installed binary — one source of truth, reachable identically from
@@ -113,6 +114,24 @@ enum Cmd {
         as_persona: Option<String>,
     },
 
+    /// Block until a peer posts (your inbox becomes non-empty), then print the
+    /// delta and exit 0. Exits 2 on timeout. This is the natural "wait for my
+    /// turn" primitive for a CLI agent loop.
+    Wait {
+        #[arg(long)]
+        collab: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long = "as")]
+        as_persona: Option<String>,
+        /// Give up after this many seconds (0 = wait forever). Default 1800.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+        /// Poll interval in seconds.
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+    },
+
     /// Acknowledge the current pending signal (archive it) after responding.
     Ack {
         #[arg(long)]
@@ -189,6 +208,17 @@ fn main() -> Result<()> {
             let (cfg, _name) = resolve(collab, config)?;
             let persona = as_persona.unwrap_or_else(|| cfg.default_persona());
             cmd_inbox(&cfg, &persona)
+        }
+        Cmd::Wait {
+            collab,
+            config,
+            as_persona,
+            timeout,
+            interval,
+        } => {
+            let (cfg, _name) = resolve(collab, config)?;
+            let persona = as_persona.unwrap_or_else(|| cfg.default_persona());
+            cmd_wait(&cfg, &persona, timeout, interval)
         }
         Cmd::Ack {
             collab,
@@ -407,23 +437,19 @@ fn cmd_post(
     Ok(())
 }
 
-/// Show the pending peer delta, computed LIVE from the consume cursor — works
-/// whether or not a watcher is running.
-fn cmd_inbox(cfg: &Config, persona: &str) -> Result<()> {
+/// The peer delta since this persona's cursor, computed LIVE — works whether or
+/// not a watcher is running.
+fn current_delta(cfg: &Config, persona: &str) -> Result<Vec<board::Turn>> {
     let board_path = cfg.board_path();
     let sc = Sidecars::derive(&board_path, persona);
     let st = state::WatchState::load(&sc.state);
-    let turns = board::delta_since(&board_path, st.offset, persona)?;
-    if turns.is_empty() {
-        if pending::is_raised(&sc) {
-            println!("inbox clear — no new peer turns (stale watcher flag set; run `spriff ack` to clear).");
-        } else {
-            println!("inbox clear — no new peer turns. Not your turn.");
-        }
-        return Ok(());
-    }
+    board::delta_since(&board_path, st.offset, persona)
+}
+
+/// Print the captured peer turns plus the canonical "what to do next" footer.
+fn print_delta(turns: &[board::Turn]) {
     println!("{} new turn(s) since your last ack:\n", turns.len());
-    for t in &turns {
+    for t in turns {
         println!("{}", t.header());
         if !t.body.is_empty() {
             println!("\n{}", t.body);
@@ -432,7 +458,41 @@ fn cmd_inbox(cfg: &Config, persona: &str) -> Result<()> {
     }
     println!("\nRespond:  spriff post -s \"<subject>\" --status <STATUS> -m \"<reply>\"");
     println!("Then:     spriff ack");
+}
+
+fn cmd_inbox(cfg: &Config, persona: &str) -> Result<()> {
+    let sc = Sidecars::derive(&cfg.board_path(), persona);
+    let turns = current_delta(cfg, persona)?;
+    if turns.is_empty() {
+        if pending::is_raised(&sc) {
+            println!("inbox clear — no new peer turns (stale watcher flag set; run `spriff ack` to clear).");
+        } else {
+            println!("inbox clear — no new peer turns. Not your turn.");
+        }
+        return Ok(());
+    }
+    print_delta(&turns);
     Ok(())
+}
+
+/// Block until a peer posts (the delta becomes non-empty), then print it. Exits
+/// 0 on a peer turn, 2 on timeout. The natural "wait for my turn" agent primitive.
+fn cmd_wait(cfg: &Config, persona: &str, timeout_secs: u64, interval_secs: u64) -> Result<()> {
+    let start = Instant::now();
+    let interval = Duration::from_secs(interval_secs.max(1));
+    eprintln!("[spriff] waiting for a peer turn as {persona}…");
+    loop {
+        let turns = current_delta(cfg, persona)?;
+        if !turns.is_empty() {
+            print_delta(&turns);
+            return Ok(());
+        }
+        if timeout_secs > 0 && start.elapsed().as_secs() >= timeout_secs {
+            eprintln!("[spriff] no peer turn within {timeout_secs}s — still your move, or your peer is quiet.");
+            std::process::exit(2);
+        }
+        std::thread::sleep(interval);
+    }
 }
 
 fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {

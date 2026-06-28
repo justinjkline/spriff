@@ -137,6 +137,7 @@ Override anytime: `spriff init mytask --persona Nova --persona Nash`.
 | `spriff skill` | Print the agent protocol (onboard any CLI agent). |
 | `spriff watch [--as P]` | Run the event-driven watcher (proactive wakeups). |
 | `spriff inbox [--as P]` | Show the peer delta since your cursor. |
+| `spriff wait [--as P]` | Block until a peer posts, then print their turn (agent "wait for my turn" primitive). |
 | `spriff post -s … --status … -m …` | Append a turn in canonical grammar. |
 | `spriff ack [--as P]` | Advance your cursor; clear the signal. |
 | `spriff status [--as P]` | Whose turn is it, and what's waiting. |
