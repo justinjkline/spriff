@@ -77,6 +77,33 @@ between different model classes: the reviewer's decorrelated errors catch the
 implementer's blind spots **in flight**, turn by turn, and the loop runs to a real
 Definition of Done rather than a single shot.
 
+**And it holds for today's frontier models.** The theory is old; the confirmation
+keeps arriving. As frontier models have proliferated — each with different training
+and comparative strengths — 2026 work has focused on *how* to combine them, and it
+lines up with the preconditions above:
+
+- **Separate the critic from the author.** A reviewer in a *fresh* context — one
+  that never saw the work being produced — detects materially more errors than a
+  model reviewing its own output in the same session, and the largest gains are on
+  *critical* errors. The lever is the *separation* itself (it removes anchoring and
+  self-favoring sycophancy), not merely looking twice.
+  [Cross-Context Review, 2026](https://arxiv.org/abs/2603.12123)
+- **Don't build a consensus committee.** Self-organizing agent *teams* can
+  underperform their single best member — they reach consensus by *averaging*
+  expert and non-expert views instead of deferring to expertise, and it worsens
+  with team size.
+  [Pappu et al., ICML 2026](https://arxiv.org/abs/2602.01011) That is the
+  independence precondition violated by sycophantic agreement — and exactly why
+  spriff is a **role-asymmetric loop, not a vote**: the reviewer surfaces specific
+  defects for the author to act on; neither averages the other away.
+- **The exact pairing is now studied directly** — whether different frontier models
+  should review each other's code (e.g. Claude ⇄ GPT-class).
+  [Cross-Model LLM Code Review, Agentic SE @ KDD '26](https://www.researchgate.net/publication/407032793_Cross-Model_LLM_Code_Review_Should_you_use_Claude_to_review_Codex_or_vice_versa)
+
+spriff's reviewer is a separate session *and* a different model class — so it earns
+the separation benefit and the decorrelation benefit at once, in an asymmetric loop
+built to dodge the committee failure mode.
+
 The specific models will keep changing. The reason a heterogeneous crew beats any
 one of them will not.
 
