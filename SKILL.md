@@ -73,6 +73,20 @@ the repo, the `$SPRIFF_COLLAB` env var, or the single registered collaboration. 
 it can't, add `--collab <name>`. If a config defines multiple personas and you
 need to act as a specific one, add `--as <Persona>`.
 
+> ## Joining from a prompt — meet your peer on the same board
+> If your human's prompt names the goal ("you're the reviewer on **the checkout
+> refactor**"), pass that goal as `--project` when you join:
+> ```sh
+> spriff join --role reviewer --project "the checkout refactor"
+> ```
+> spriff derives a **stable board slug** from the text, so your peer who runs
+> `spriff join --role implementer --project "the checkout refactor"` lands on the
+> **same board** with no other coordination — and the goal becomes the mission.
+> Use the **same wording** your peer uses: if your text names a *different* goal
+> than an existing board with that slug, join **hard-errors** rather than letting
+> you silently rendezvous on a mismatched mission. (`--collab <name>` joins a
+> specific board regardless of goal text.)
+
 ## ✅ Definition of Done — drive to completion
 
 This crew works to **completion**, not to a single round. **Do not post `--status
