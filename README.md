@@ -163,17 +163,50 @@ cargo install --path .  # installs to ~/.cargo/bin/spriff
 
 ## Quickstart
 
-There's nothing to configure. Tell each agent its role and to use spriff — it
-self-onboards with one command:
+There's nothing to configure. You give each agent a **one-line prompt** naming its
+role and the goal — spriff's `join` does the rest, printing the agent's identity,
+the full protocol, its loop, and (for the reviewer) the skeptical review contract.
+
+### The prompts to give your agents
+
+Start **two different frontier models** (that's the whole point) — e.g. Claude as
+the implementer, Codex/GPT as the reviewer — each in your repo, and paste:
+
+> **🛠 Implementer** (e.g. Claude):
+> You're the implementer on a spriff collaboration with a reviewer. Run
+> `spriff join --role implementer --project "<your goal>"` and do exactly what it
+> prints — it gives you your identity, the protocol, and your loop. Build the
+> feature, post your work for review, and keep the implement↔review loop going
+> until it's feature-complete, tested, and PR'd.
+
+> **🔎 Reviewer** (e.g. Codex / GPT):
+> You're the reviewer on a spriff collaboration with an implementer. Run
+> `spriff join --role reviewer --project "<the same goal>"` and do exactly what it
+> prints. Try to break their work — post specific findings (`file:line`, the
+> failing case), never a bare "LGTM" — and keep reviewing until it's genuinely done.
+
+Both agents pass the **same `--project` text**, so they rendezvous on the same
+board with zero other coordination. That single `join` teaches each agent
+everything it needs; you don't have to explain the protocol. If a session ever
+goes quiet, `spriff doctor --as <you>` shows exactly why.
+
+> **Tip — never nudge them again:** the prompts above run each agent interactively
+> (you can watch and chat). For fully hands-off, supervise each side with
+> [`spriff serve`](#ironclad-mode--agents-that-cant-go-idle) instead — it re-invokes
+> the agent fresh every turn and survives stops, timeouts, and crashes.
+
+### Under the hood
+
+That one `join` is all an agent runs to onboard:
 
 ```sh
 # In the implementer's session / repo:
-spriff join --role implementer
-#   → "You are Abbey — the implementer on collaboration 'default'." + the protocol.
+spriff join --role implementer --project "fix the checkout flow"
+#   → "You are Abbey — the implementer on 'fix-the-checkout-flow'." + the protocol.
 
 # In the reviewer's session / repo (even a different clone):
-spriff join --role reviewer
-#   → "You are Alice — the reviewer on collaboration 'default'." + the protocol.
+spriff join --role reviewer --project "fix the checkout flow"
+#   → "You are Alice — the reviewer …" + the protocol, on the SAME board.
 ```
 
 `join` creates the collaboration if needed, claims the right persona, and writes a

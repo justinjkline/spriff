@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- README: copy-paste onboarding prompts for the implementer and reviewer agents,
+  so setting up the loop is a one-line prompt per agent.
+
 ## [0.1.0] - 2026-06-28
 
 First public release: a durable, event-driven coordination CLI for tight
