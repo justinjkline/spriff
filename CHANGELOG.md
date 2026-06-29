@@ -31,6 +31,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: copy-paste onboarding prompts for the implementer and reviewer agents,
   so setting up the loop is a one-line prompt per agent.
 
+### Fixed
+
+- **`spriff wait` now refuses split-brain persona ownership.** `wait` is the
+  current-session / operator-steered loop. If a separate `spriff serve` supervisor
+  already holds the same persona lock, `wait` now hard-errors instead of letting
+  two agents act as the same reviewer/implementer and race/double-post. Operators
+  can intentionally override with `--allow-while-supervised`, but the default path
+  is fail-closed and explains the choice: either let the supervised child handle
+  turns, or stop it before this live session takes over.
+- **Status and operating docs now distinguish "subscribed" from "this chat is
+  watching."** `spriff status` says that `subscribed: yes` means a separate child
+  agent command will be re-invoked; `subscribed: no` is expected for an
+  interactive `spriff wait` loop. `serve`/`supervise`, README, OPERATING, and the
+  embedded SKILL protocol now all describe the same foreground-vs-autonomous
+  choice.
+- **Shell pipelines no longer emit broken-pipe panic noise.** Unix builds restore
+  default `SIGPIPE` handling at startup, so common checks like
+  `spriff status | grep -q subscribed` terminate quietly when the reader exits
+  early instead of printing Rust's `failed printing to stdout: Broken pipe` panic.
+- **Onboarding now forces the "who acts as this persona?" decision up front.**
+  `join` and `SKILL.md` previously jumped straight to `spriff supervise`/`serve`,
+  which silently spawns a SEPARATE headless agent — so an assistant asked, inside
+  a live chat, to "set up spriff and review" would background a different agent and
+  the operator would lose the session they wanted to steer. Step 0 now makes the
+  agent choose (and, if a human is present, ASK) between: (A) THIS session is the
+  persona — run the interactive `inbox -> work -> post -> ack -> wait` loop here,
+  no supervisor; or (B) a separate supervised process via `supervise`/`serve`. The
+  GOLDEN RULE section is reframed around "which mode are you in?", and clarifies
+  that `subscribed: no` is EXPECTED (not a failure) in mode (A).
+- `spriff ack` no longer swallows a peer turn that arrives mid-turn. Previously
+  `ack` advanced the consume cursor to the LIVE board end (`offset =
+  board_size()`), so a peer turn posted AFTER the agent read its inbox but BEFORE
+  it acked was leapfrogged and never resurfaced — and under `spriff serve` the
+  supervisor then computed an empty delta and never re-invoked the agent (a
+  silently skipped beat). `ack` now advances only to the agent's READ FRONTIER —
+  the board end as of its most recent `inbox`/`wait` — which `inbox`/`wait`
+  record when they actually show turns. A turn that lands after that read stays
+  unread. `status`/`doctor`/the serve completion-poll never move the frontier, so
+  read-only polling can't consume unseen turns. Regression test:
+  `ack_does_not_swallow_a_turn_that_arrived_after_the_read`.
+- `spriff supervise --install -- codex exec` / `claude -p` now resolves the agent
+  binary through the operator's current `PATH` before writing the launchd/systemd
+  service, and carries `HOME` + `PATH` into the service environment. macOS launchd
+  starts jobs with a sparse PATH, so the previous generated plist could load
+  `spriff serve` successfully but then fail every peer turn with `codex: No such
+  file or directory`.
+- Board parsing now treats only valid spriff turn headers as turn boundaries.
+  Body-level Markdown H2 headings such as `## Review Notes` no longer split a
+  post into phantom turns or cause a persona to see its own body sections as
+  unread peer work.
+
 ### Notes
 
 - Stall and proactive-review nudges are written to dedicated, **non-acked**

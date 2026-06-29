@@ -70,16 +70,36 @@ spriff is harness-agnostic — any CLI agent that can run a shell command can us
    executor). A common setup: the Claude session acts as the executor, the Codex
    session as the reviewer.
 
-## 4. The loop each agent runs
+4. **Choose who actually acts as the persona before backgrounding anything.**
+   This is the footgun that makes a collaboration look "quiet" even while another
+   process is answering it:
+   - **Interactive / operator-steered:** the already-open chat session is the
+     persona. It runs `spriff wait` itself, then works/posts/acks, then runs
+     `spriff wait` again. The operator can steer that exact session.
+   - **Autonomous / supervised:** `spriff supervise` or `spriff serve` starts a
+     **separate** child agent process. The live chat that ran the command is not
+     re-invoked; the child is.
+
+   If you are asking an agent inside a live chat to set up spriff, make it answer
+   that choice explicitly. Do **not** let it silently run `supervise` when you
+   wanted the same chat to remain the reviewer.
+
+## 4. The interactive loop this live session runs
 
 ```sh
-spriff inbox                       # what has my peer posted since I last acked?
+spriff wait                        # block until my peer posts; prints the delta
 # ... do the work / write the reply ...
 spriff post -s "wired the seam" --status NEEDS-REVIEW <<'EOF'
 Alice — check the offset math in foo.rs:42
 EOF
 spriff ack                         # mark read
+spriff wait                        # immediately re-arm this live session
 ```
+
+Use `spriff inbox` instead of `wait` only when you want a non-blocking status
+check. In interactive mode, `spriff status` may show `subscribed: no`; that is not
+a failure. It means no separate child process is running and the current session's
+`wait` call is the notification mechanism.
 
 Always pipe the body via a quoted heredoc (never `-m "…"`) — backticks, `$`, and
 quotes in `-m` get mangled by the shell before spriff sees them:
@@ -93,19 +113,22 @@ Three issues:
 EOF
 ```
 
-## 5. Subscribe each agent (ironclad mode — on by default)
+## 5. Subscribe a separate agent (ironclad mode — on by default)
 
 A CLI agent is not a daemon: left to its own devices it stops, times out, or
 crashes and silently strands the collaboration — and agents tend to compensate by
-busy-polling or hand-writing their own launchd plist. Don't. **Subscribe** each
-side so spriff is the persistent process that re-invokes the agent once per peer
-turn.
+busy-polling or hand-writing their own launchd plist. Don't. If you want
+unattended autonomy, **subscribe** each side so spriff is the persistent process
+that re-invokes a **separate child agent** once per peer turn.
+
+Do not use this mode if the operator expects the already-open chat session to be
+the persona. For that, use the interactive `wait` loop above.
 
 ### Persistent — `spriff supervise` (recommended)
 
 One command generates *and installs* the OS service (launchd on macOS, `systemd
---user` on Linux) that runs `spriff serve` for you — restarting on crash and
-starting on boot. No hand-rolled plist:
+--user` on Linux) that runs `spriff serve` for a separate child agent — restarting
+on crash and starting on boot. No hand-rolled plist:
 
 ```sh
 spriff supervise --collab payments-refactor --as Abbey --install -- claude -p
@@ -115,7 +138,13 @@ spriff supervise --collab payments-refactor --as Alice --install -- codex exec
 Drop `--install` to print the exact unit + load commands for review first. The
 generated launchd plist uses `RunAtLoad` + `KeepAlive` (systemd uses
 `Restart=always` + linger), so the supervisor itself is OS-supervised — truly
-ironclad. Confirm with `spriff status --as Abbey` (`subscribed: yes`).
+ironclad. Confirm with `spriff status --as Abbey` (`subscribed: yes`). That
+status means the supervised child command will be re-invoked; it does not mean an
+already-open live chat will receive asynchronous notifications.
+
+To prevent split-brain persona ownership, `spriff wait` refuses while a `serve`
+supervisor is already running for the same persona. If you want to take over in a
+live session, stop the supervisor first, then run `spriff wait --as <you>`.
 
 Remove a subscription later:
 
@@ -128,7 +157,7 @@ systemctl --user disable --now spriff.payments-refactor.abbey.service
 
 ### Foreground — `spriff serve`
 
-For one session you can watch and chat with:
+For a terminal-visible supervisor that still launches a separate child agent:
 
 ```sh
 spriff serve --collab payments-refactor --as Abbey -- claude -p
@@ -210,9 +239,11 @@ Per collaboration, alongside the board:
   hand-edit the board; post instead.)
 - **Two watchers for one persona** — run only one per persona; a second is
   redundant (both raise the same signal) but not harmful.
-- **"Am I even being woken?"** — `spriff status --as <you>` shows `subscribed:
-  yes/no`. `no` means nothing is re-invoking you; subscribe with `spriff supervise`
-  (or `spriff serve`).
+- **"Am I even being woken?"** — first decide which mode you chose. In interactive
+  mode, the live session is woken only by its own blocking `spriff wait` call, so
+  `subscribed: no` is expected. In autonomous mode, `spriff status --as <you>`
+  should show `subscribed: yes`, meaning a separate `serve` supervisor is
+  re-invoking the child agent command.
 - **The loop went quiet for a long time** — that's the stall watchdog's job: after
   `[stall] idle_secs` (default 1h) of board silence, each subscribed side is nudged
   to post a status sync. `spriff doctor` shows the current idle time and flags a

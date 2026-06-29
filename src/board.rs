@@ -63,15 +63,30 @@ fn parse_header(line: &str) -> (String, String, String) {
     }
 }
 
-/// Return the byte offsets (into `content`) at which each `## ` header line
-/// starts. Walks line starts only, so a `## ` inside a code fence in a body is
-/// not mistaken for a header unless it begins the line (acceptable, documented).
+/// True when a line is a real spriff turn header, not just a Markdown H2 inside
+/// a turn body. The board grammar is `## <timestamp> - <author> - <subject>`;
+/// accepting every `## ` line made ordinary section headings split a post into
+/// phantom turns, which could wake peers on their own body text. Legacy em-dash
+/// headers still pass because `parse_header` normalizes them before the timestamp
+/// check.
+fn is_turn_header_line(line: &str) -> bool {
+    if !line.starts_with("## ") {
+        return false;
+    }
+    let (ts, author, _subject) = parse_header(line);
+    !author.trim().is_empty() && parse_board_ts(&ts).is_some()
+}
+
+/// Return the byte offsets (into `content`) at which each real turn header line
+/// starts. Walks line starts only, and validates the canonical header shape so a
+/// body-level Markdown `## Review Notes` (or `## #5854 - ...`) remains body text.
 fn header_offsets(content: &str) -> Vec<usize> {
     let mut offsets = Vec::new();
     let mut line_start = 0usize;
     while line_start <= content.len() {
         let rest = &content[line_start..];
-        if rest.starts_with("## ") {
+        let line = rest.split_once('\n').map_or(rest, |(line, _)| line);
+        if is_turn_header_line(line) {
             offsets.push(line_start);
         }
         match rest.find('\n') {
@@ -420,9 +435,19 @@ fn remap_sibling_cursors(board: &Path, cut: u64, new_kept_start: u64, new_len: u
         if name.starts_with(&prefix) && name.ends_with(".watch.state") {
             let p = e.path();
             let mut st = crate::state::WatchState::load(&p);
-            let remapped = remap_offset(st.offset, cut, new_kept_start, new_len);
-            if remapped != st.offset {
-                st.offset = remapped;
+            // Both the consume cursor AND the read frontier are board byte
+            // positions, so a rollup shifts BOTH and BOTH must be remapped. If we
+            // remapped only `offset`, a stale `read_frontier` left pointing past
+            // the now-smaller board would, on the next `ack`, clamp to the live
+            // board end and consume to it — silently swallowing any turn that
+            // arrived after the agent's last read (the exact mid-turn skip the
+            // frontier exists to prevent). Remap them together. PURE remap via
+            // `remap_offset` (clamped to the new length).
+            let new_offset = remap_offset(st.offset, cut, new_kept_start, new_len);
+            let new_frontier = remap_offset(st.read_frontier, cut, new_kept_start, new_len);
+            if new_offset != st.offset || new_frontier != st.read_frontier {
+                st.offset = new_offset;
+                st.read_frontier = new_frontier;
                 let _ = st.save(&p);
             }
         }
@@ -519,6 +544,22 @@ mod tests {
         let s = "## 2026-06-28T01:00Z - Peter - PR-2 - cross-repo - map\n\nx\n";
         let turns = parse_turns(s);
         assert_eq!(turns[0].subject, "PR-2 - cross-repo - map");
+    }
+
+    #[test]
+    fn body_markdown_h2_does_not_split_turns() {
+        let s = "## 2026-06-28T01:00Z - Peter - review packet\nstatus:ACTION-REQUIRED @Pamela\n\n\
+## #5854 - blocked finding\n\nThis is a body heading, not a spriff turn.\n\n\
+## Plain Markdown Heading\n\nStill the same body.\n\n-- Peter\n\n\
+## 2026-06-28T02:00Z - Pamela - fixed\nstatus:NEEDS-REVIEW @Peter\n\nbody two\n";
+
+        let turns = parse_turns(s);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].author, "Peter");
+        assert_eq!(turns[0].subject, "review packet");
+        assert!(turns[0].body.contains("## #5854 - blocked finding"));
+        assert!(turns[0].body.contains("## Plain Markdown Heading"));
+        assert_eq!(turns[1].author, "Pamela");
     }
 
     #[test]
@@ -645,6 +686,7 @@ mod tests {
         crate::state::WatchState {
             offset: cursor_before,
             last_pending_header: String::new(),
+            read_frontier: 0,
         }
         .save(&state)
         .unwrap();
@@ -668,6 +710,65 @@ mod tests {
         );
         assert_eq!(after[0].subject, "turn 4");
         assert_eq!(after[1].subject, "turn 5");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rollup_remaps_read_frontier_so_ack_cannot_swallow_after_rollup() {
+        // A rollup must remap the READ FRONTIER too, not just the consume cursor.
+        // If only `offset` were remapped, a stale `read_frontier` left pointing
+        // past the now-smaller board would, on the next `ack`, clamp to the live
+        // board end and consume to it — re-opening the mid-turn skip the frontier
+        // exists to close.
+        let dir =
+            std::env::temp_dir().join(format!("spriff-remap-frontier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let board = dir.join("t.board.md");
+        seed_board(&board, "t").unwrap();
+        for i in 1..=5 {
+            append_turn(
+                &board,
+                &format!("2026-01-01T0{i}:00Z"),
+                "Peter",
+                &format!("turn {i}"),
+                "FYI",
+                &[],
+                &format!("body {i}"),
+            )
+            .unwrap();
+        }
+        let big = board_size(&board);
+        // Pamela read turns 1–3 (cursor at start of turn 4) and her frontier is the
+        // pre-rollup board end (she had been shown the whole board at some point).
+        let content = std::fs::read_to_string(&board).unwrap();
+        let cursor_before = header_offsets(&content)[3] as u64;
+        let state = crate::paths::Sidecars::derive(&board, "Pamela").state;
+        crate::state::WatchState {
+            offset: cursor_before,
+            last_pending_header: String::new(),
+            read_frontier: big,
+        }
+        .save(&state)
+        .unwrap();
+
+        // Roll up, keeping the last 2 turns (archives 1–3); board shrinks.
+        assert_eq!(rollup(&board, 2).unwrap(), 3);
+        let small = board_size(&board);
+        assert!(small < big, "precondition: rollup shrank the board");
+
+        let st = crate::state::WatchState::load(&state);
+        // The frontier must have been remapped to within the new board, NOT left
+        // pointing past its end.
+        assert!(
+            st.read_frontier <= small,
+            "read_frontier {} dangles past the rolled-up board {} — ack would swallow",
+            st.read_frontier,
+            small
+        );
+        // And the two kept turns must still be readable (offset remapped too).
+        let after = delta_since(&board, st.offset, "Pamela").unwrap();
+        assert_eq!(after.len(), 2, "rollup stranded unread turns");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

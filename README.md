@@ -190,11 +190,13 @@ board with zero other coordination. That single `join` teaches each agent
 everything it needs; you don't have to explain the protocol. If a session ever
 goes quiet, `spriff doctor --as <you>` shows exactly why.
 
-> **Tip — never nudge them again:** the prompts above run each agent interactively
-> (you can watch and chat). For fully hands-off, subscribe each side with
-> [`spriff supervise`](#ironclad-mode--on-by-default) instead — it installs an OS
-> service that re-invokes the agent fresh every turn and survives stops, timeouts,
-> crashes, and reboots.
+> **Tip — choose the run mode deliberately:** if you pasted those prompts into
+> live chats and want to keep steering those exact sessions, that is the
+> interactive mode: each session runs the `spriff wait` loop itself. If you want
+> fully hands-off autonomy instead, subscribe each side with
+> [`spriff supervise`](#ironclad-mode--on-by-default) — it launches a **separate**
+> headless agent process, re-invoked fresh every turn, and survives stops,
+> timeouts, crashes, and reboots.
 
 ### Under the hood
 
@@ -231,23 +233,33 @@ That's the whole thing. To run several collaborations at once, name them:
 A CLI agent isn't a daemon: left to loop on `spriff wait` it can stop, hit a turn
 limit, or crash and silently strand the collaboration — and agents tend to paper
 over that by busy-polling or hand-rolling their own launchd plist. So **ironclad
-mode is the default**, and `join` tells every agent to *subscribe* to its board the
-real way: let **spriff** be the persistent process and **re-invoke your agent for
-one turn every time a peer posts**.
+mode is available by default**, but `join` now forces the first decision before
+anyone backgrounds work:
+
+- **This live session is the persona.** Run the interactive loop here:
+  `spriff wait` → work → `spriff post` → `spriff ack` → `spriff wait` again. The
+  operator can watch and steer the same chat. In this mode, `spriff status` may
+  show `subscribed: no`; that is expected because the `wait` command is the loop.
+- **A separate supervised process is the persona.** Use `spriff supervise` or
+  `spriff serve` below. spriff becomes the persistent process and re-invokes a
+  fresh child agent for one turn every time a peer posts. This is autonomous, but
+  it is **not** the already-open live chat.
 
 ```sh
 # Subscribe persistently — generates + installs an OS service (launchd/systemd)
-# that runs `spriff serve` for you, restarts it on crash, and starts it on boot:
+# that runs `spriff serve` for a SEPARATE child agent, restarts it on crash, and starts it on boot:
 spriff supervise --as Pamela --install -- claude -p     # implementer, driven by Claude
 spriff supervise --as Peter  --install -- codex exec    # reviewer, driven by Codex
 
-# …or run a foreground supervisor for one session you can watch:
+# …or run a foreground supervisor you can watch in a terminal (still a separate child agent):
 spriff serve --as Pamela -- claude -p
 ```
 
-`spriff status --as <you>` shows `subscribed: yes` once you're under a supervisor.
-A dead agent is just re-spawned on the next peer turn. Two more guards ride along,
-both on by default:
+`spriff status --as <you>` shows `subscribed: yes` once a separate supervisor is
+running. To avoid two agents racing as the same persona, `spriff wait` refuses
+while that supervisor holds the persona lock unless you explicitly pass
+`--allow-while-supervised`. A dead supervised child is just re-spawned on the next
+peer turn. Two more guards ride along, both on by default:
 
 - **Stall watchdog.** If the whole board goes silent for an hour (`[stall]
   idle_secs`), spriff pings every party to post a status update and recommend next
@@ -281,11 +293,11 @@ Bring your own cast: `spriff join --role implementer --as Pamela --with Peter`
 | `spriff init <name> [--agents N] [--letter X] [--persona …]` | Create + register a collaboration explicitly. |
 | `spriff list` | List registered collaborations and rosters. |
 | `spriff skill` | Print the agent protocol (onboard any CLI agent). |
-| `spriff supervise [--as P] [--install] -- <agent-cmd>` | **Subscribe for real.** Generate (and with `--install` load) an OS service that runs `spriff serve` for you — restarts on crash, starts on boot. No hand-rolled plist. |
-| `spriff serve [--as P] -- <agent-cmd>` | **Ironclad loop.** Supervise an agent: re-invoke it for one turn on every peer post, surviving agent stop/crash/timeout. |
+| `spriff supervise [--as P] [--install] -- <agent-cmd>` | **Autonomous separate agent.** Generate (and with `--install` load) an OS service that runs `spriff serve` — restarts on crash, starts on boot. No hand-rolled plist. |
+| `spriff serve [--as P] -- <agent-cmd>` | **Foreground supervisor for a separate child.** Re-invoke `<agent-cmd>` for one turn on every peer post, surviving child stop/crash/timeout. |
 | `spriff watch [--as P]` | Run the event-driven watcher (proactive wakeups + stall/early-review nudges). |
 | `spriff inbox [--as P]` | Show the peer delta since your cursor. |
-| `spriff wait [--as P]` | Block until a peer posts, then print their turn (agent "wait for my turn" primitive). |
+| `spriff wait [--as P]` | Interactive/current-session primitive: block until a peer posts, then print their turn. Refuses if a separate `serve` already owns that persona. |
 | `spriff post -s … --status … <<'EOF' … EOF` | Append a turn (pipe the body via heredoc). |
 | `spriff ack [--as P]` | Advance your cursor; clear the signal. |
 | `spriff status [--as P]` | Whose turn is it, and what's waiting. |

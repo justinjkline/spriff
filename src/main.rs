@@ -248,7 +248,7 @@ enum Cmd {
 
     /// Block until a peer posts (your inbox becomes non-empty), then print the
     /// delta and exit 0. Exits 2 on timeout. This is the natural "wait for my
-    /// turn" primitive for a CLI agent loop.
+    /// turn" primitive for the CURRENT interactive CLI agent loop.
     Wait {
         #[arg(long)]
         collab: Option<String>,
@@ -262,6 +262,11 @@ enum Cmd {
         /// Poll interval in seconds.
         #[arg(long, default_value_t = 2)]
         interval: u64,
+        /// Advanced: allow waiting even when a separate `serve` supervisor is
+        /// already running for this persona. Normally refused to prevent two
+        /// agents with the same identity racing/double-posting.
+        #[arg(long)]
+        allow_while_supervised: bool,
     },
 
     /// Declare source paths you're touching, so your peers' watchers wake on your
@@ -321,7 +326,20 @@ enum Cmd {
     },
 }
 
+fn restore_default_sigpipe() {
+    // Rust ignores SIGPIPE by default and turns an early-closing stdout consumer
+    // (`spriff status | grep -q …`) into a noisy "failed printing to stdout:
+    // Broken pipe" panic. spriff is a shell-native coordination CLI, so Unix
+    // pipeline composition should behave like standard tools: terminate quietly
+    // when the reader is done.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> Result<()> {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Join {
@@ -465,10 +483,11 @@ fn main() -> Result<()> {
             as_persona,
             timeout,
             interval,
+            allow_while_supervised,
         } => {
             let (cfg, _name) = resolve(collab, config)?;
             let persona = resolve_persona(as_persona, &cfg);
-            cmd_wait(&cfg, &persona, timeout, interval)
+            cmd_wait(&cfg, &persona, timeout, interval, allow_while_supervised)
         }
         Cmd::Touching {
             paths,
@@ -489,18 +508,40 @@ fn main() -> Result<()> {
             let persona = resolve_persona(as_persona, &cfg);
             let board_path = cfg.board_path();
             let sc = Sidecars::derive(&board_path, &persona);
-            // Advance the consume cursor to "everything up to now" and clear the
-            // dedup guard, so the same peer turns won't reappear in your inbox.
+            // Advance the consume cursor to the READ FRONTIER — the board end as
+            // of the agent's most recent `inbox`/`wait`/`status` — NOT the live
+            // board end. This is the fix for the mid-turn skip: a peer turn that
+            // landed AFTER the agent read its inbox but BEFORE this `ack` is at a
+            // byte offset beyond the frontier, so it survives as unread instead of
+            // being silently consumed. (Old behavior — `offset = board_size()` —
+            // jumped the cursor past such a turn, and under `serve` the supervisor
+            // then saw an empty delta and never re-invoked: a skipped beat.)
             let mut st = state::WatchState::load(&sc.state);
-            st.offset = board::board_size(&board_path);
+            let board_end = board::board_size(&board_path);
+            // Clamp a stale/over-large frontier to the live board, and never move
+            // the consume cursor BACKWARD (a frontier below an already-advanced
+            // offset — e.g. after a rollup remap — must not rewind the cursor).
+            let frontier = st.read_frontier.min(board_end);
+            st.offset = st.offset.max(frontier);
             st.last_pending_header = String::new();
             st.save(&sc.state)?;
             // Archive any proactive watcher signal (flag/pending/action) too.
             let archived = pending::ack(&sc)?;
-            if archived {
-                println!("acked — caught up; watcher signal archived. Inbox clear.");
+            // Tell the truth about whether anything is still unread: a turn that
+            // arrived mid-turn is now correctly retained, so report it instead of
+            // the old unconditional "Inbox clear".
+            let still_unread = board::delta_since(&board_path, st.offset, &persona)?.len();
+            let tail = if still_unread > 0 {
+                format!(
+                    " {still_unread} new peer turn(s) arrived since your last read — run `spriff inbox`."
+                )
             } else {
-                println!("acked — caught up. Inbox clear.");
+                " Inbox clear.".to_string()
+            };
+            if archived {
+                println!("acked — caught up to your last read; watcher signal archived.{tail}");
+            } else {
+                println!("acked — caught up to your last read.{tail}");
             }
             Ok(())
         }
@@ -1380,28 +1421,49 @@ fn cmd_join(
     let stall_idle = cfg.stall_idle_secs();
     let stall_min = (stall_idle / 60).max(1);
     if cfg.is_ironclad() {
-        println!("\n═══════════ STEP 0 — SUBSCRIBE TO YOUR BOARD (do this FIRST) ═══════════");
-        println!("IRONCLAD MODE is the default, and a CLI agent is not a daemon: left on your own");
-        println!("you'll stop, hit a turn limit, or crash and silently strand the collaboration.");
         println!(
-            "So DON'T busy-poll, and DON'T hand-roll a launchd plist — subscribe the real way:"
+            "\n═══════════ STEP 0 — DECIDE WHO ACTS AS {me} (ask the operator FIRST) ═══════════"
+        );
+        println!(
+            "Before backgrounding anything, settle ONE question. If a HUMAN is in a live chat"
+        );
+        println!("with you right now, ASK them — do not assume. This is the #1 setup mistake:");
+        println!("an agent asked in a chat to \"set up spriff and review\" silently backgrounds a");
+        println!("SEPARATE agent, and the human loses the live session they wanted to steer.\n");
+        println!("  (A) THIS session is {me} — interactive / operator-steered.");
+        println!(
+            "      The agent the operator is already chatting with IS the persona. You run the"
+        );
+        println!("      loop yourself: inbox -> work -> post -> ack -> `spriff wait --as {me}`.");
+        println!(
+            "      The operator sees every turn and can interrupt to steer. In mode (A) do NOT"
+        );
+        println!("      run `spriff supervise`/`serve` — that spawns a DIFFERENT agent, not you.");
+        println!("  (B) A SEPARATE supervised process — hands-off / autonomous.");
+        println!(
+            "      A fresh headless agent spriff re-invokes once per peer turn, independent of"
+        );
+        println!("      this chat. The operator then reviews via the board, not this chat:");
+        println!("        ▶ PERSISTENT (restarts on crash, starts on boot):");
+        println!("              spriff supervise --as {me} --install -- <your-agent-cmd>");
+        println!("        ▶ FOREGROUND (one session you can watch):");
+        println!("              spriff serve --as {me} -- <your-agent-cmd>");
+        println!(
+            "          (<your-agent-cmd> is a headless agent, e.g. `claude -p` or `codex exec`.)"
         );
         println!();
-        println!("  ▶ PERSISTENT (best — restarts on crash, starts on boot):");
-        println!("        spriff supervise --as {me} --install -- <your-agent-cmd>");
-        println!("  ▶ FOREGROUND (one session, you can watch/chat):");
-        println!("        spriff serve --as {me} -- <your-agent-cmd>");
         println!(
-            "    (<your-agent-cmd> is your headless agent, e.g. `claude -p` or `codex exec`.)"
+            "⚠ `supervise`/`serve` BOTH start a NEW agent process — NOT the session you're in."
         );
-        println!();
+        println!("  If the operator wanted YOU (this session) to review, that is (A): run the");
+        println!("  `wait`-loop below and never background a supervisor.\n");
         println!(
-            "Either way spriff becomes the daemon and RE-INVOKES you once per peer turn, so you"
+            "If you chose (B), spriff becomes the daemon and RE-INVOKES that agent once per peer"
         );
         println!(
-            "do EXACTLY ONE turn per wake, then EXIT (no `spriff wait`, no polling). Also ON BY"
+            "turn, so it does EXACTLY ONE turn per wake then EXITS (no `spriff wait`). Also ON"
         );
-        println!("DEFAULT once subscribed:");
+        println!("BY DEFAULT once subscribed:");
         if stall_idle > 0 {
             println!(
                 "  • a STALL WATCHDOG pings everyone to resync if the board goes silent >{stall_min}min;"
@@ -1421,9 +1483,17 @@ fn cmd_join(
             );
             println!("    run `spriff touching <paths>` to point them at what you're building.");
         }
-        println!("\nConfirm you're subscribed anytime: `spriff status --as {me}` (shows \"subscribed: yes\").");
-        println!("Only if you truly can't be supervised, run the manual loop below as a FALLBACK.");
-        println!("\n═══════════ YOUR JOB — one turn each time you're woken ═══════════");
+        println!("\nConfirm a (B) subscription anytime: `spriff status --as {me}` (\"subscribed: yes\").");
+        println!("In mode (A) `subscribed: no` is EXPECTED — your own `wait`-loop is the engine.");
+        println!(
+            "If mode (A)'s `spriff wait --as {me}` refuses because a supervisor is already running,"
+        );
+        println!(
+            "do NOT run two {me}s. Let the separate agent work, or stop it before this session takes over."
+        );
+        println!(
+            "\n═══════════ YOUR JOB — (A) run the loop below · (B) one turn per wake ═══════════"
+        );
     } else {
         println!("\n═══════════ YOUR JOB — run this loop, and NEVER stop on your own ═══════════");
     }
@@ -1593,6 +1663,20 @@ fn cmd_post(
 /// The peer delta since this persona's cursor, computed LIVE — works whether or
 /// not a watcher is running.
 fn current_delta(cfg: &Config, persona: &str) -> Result<Vec<board::Turn>> {
+    Ok(read_delta(cfg, persona)?.0)
+}
+
+/// Read the unread peer delta AND report the exact board size it was read to.
+///
+/// The returned size is the byte offset just past the last turn included in the
+/// delta — i.e. the precise READ FRONTIER a subsequent `ack` may safely consume
+/// to. Callers that actually SHOW the turns to the agent (`inbox`, `wait`)
+/// persist that size via `record_read_frontier`, so a peer turn that lands after
+/// this read but before the agent's `ack` stays at a higher offset and is never
+/// swallowed. Pollers that only show a COUNT (`status`, `doctor`) or drive the
+/// supervisor loop call this WITHOUT recording a frontier, so they can never
+/// advance the consume cursor past content the agent has not seen.
+fn read_delta(cfg: &Config, persona: &str) -> Result<(Vec<board::Turn>, u64)> {
     let board_path = cfg.board_path();
     let sc = Sidecars::derive(&board_path, persona);
     let mut st = state::WatchState::load(&sc.state);
@@ -1606,7 +1690,29 @@ fn current_delta(cfg: &Config, persona: &str) -> Result<Vec<board::Turn>> {
         st.offset = size;
         let _ = st.save(&sc.state);
     }
-    board::delta_since(&board_path, st.offset, persona)
+    // `delta_since` reads to the board size AT ITS CALL; capture that same size so
+    // the frontier a caller records matches exactly what was returned (no
+    // time-of-check/use gap where a turn that arrived after this read is wrongly
+    // marked seen).
+    let read_to = board::board_size(&board_path);
+    let turns = board::delta_since(&board_path, st.offset, persona)?;
+    Ok((turns, read_to))
+}
+
+/// Persist the READ FRONTIER after the agent has actually been SHOWN the board up
+/// to `read_to`. Monotonic (never rewinds) and clamped to the live board so a
+/// stale frontier can't later consume past the end. Only the agent-facing read
+/// commands that print real turns call this; `ack` advances the consume cursor
+/// only as far as the frontier recorded here.
+fn record_read_frontier(cfg: &Config, persona: &str, read_to: u64) {
+    let board_path = cfg.board_path();
+    let sc = Sidecars::derive(&board_path, persona);
+    let mut st = state::WatchState::load(&sc.state);
+    let clamped = read_to.min(board::board_size(&board_path));
+    if clamped > st.read_frontier {
+        st.read_frontier = clamped;
+        let _ = st.save(&sc.state);
+    }
 }
 
 /// Print the captured peer turns plus the canonical "what to do next" footer.
@@ -1633,16 +1739,24 @@ fn print_delta(turns: &[board::Turn]) {
 
 fn cmd_inbox(cfg: &Config, persona: &str) -> Result<()> {
     let sc = Sidecars::derive(&cfg.board_path(), persona);
-    let turns = current_delta(cfg, persona)?;
+    let (turns, read_to) = read_delta(cfg, persona)?;
     if turns.is_empty() {
         if pending::is_raised(&sc) {
             println!("inbox clear — no new peer turns (stale watcher flag set; run `spriff ack` to clear).");
         } else {
             println!("inbox clear — no new peer turns. Not your turn.");
         }
+        // Even an empty read advances the frontier to "everything that exists now
+        // has been shown", so a later `ack` after an intervening peer post does
+        // not consume that post. (Harmless when nothing is unread.)
+        record_read_frontier(cfg, persona, read_to);
         return Ok(());
     }
     print_delta(&turns);
+    // The agent has now SEEN every turn in this delta. Record how far the read
+    // reached so `ack` consumes exactly this much and never a turn that arrives
+    // afterward (the mid-turn-skip fix).
+    record_read_frontier(cfg, persona, read_to);
     Ok(())
 }
 
@@ -1676,14 +1790,37 @@ fn cmd_touching(cfg: &Config, persona: &str, paths: &[PathBuf]) -> Result<()> {
 
 /// Block until a peer posts (the delta becomes non-empty), then print it. Exits
 /// 0 on a peer turn, 2 on timeout. The natural "wait for my turn" agent primitive.
-fn cmd_wait(cfg: &Config, persona: &str, timeout_secs: u64, interval_secs: u64) -> Result<()> {
+fn cmd_wait(
+    cfg: &Config,
+    persona: &str,
+    timeout_secs: u64,
+    interval_secs: u64,
+    allow_while_supervised: bool,
+) -> Result<()> {
+    if !allow_while_supervised && is_serve_running(&cfg.board_path(), persona) {
+        anyhow::bail!(
+            "`spriff wait` is the CURRENT-session / operator-steered loop, but a separate \
+             `spriff serve` supervisor is already running for {persona}. Do not run two agents \
+             as the same persona: either let the supervised child handle turns, or stop that \
+             supervisor first and then run `spriff wait --as {persona}` here. If you are only \
+             inspecting and explicitly accept the duplicate-agent risk, re-run with \
+             --allow-while-supervised."
+        );
+    }
     let start = Instant::now();
     let interval = Duration::from_secs(interval_secs.max(1));
-    eprintln!("[spriff] waiting for a peer turn as {persona}…");
+    eprintln!(
+        "[spriff] interactive wait-loop armed as {persona}; this command notifies THIS session. \
+         Do not also run `spriff serve`/`supervise` for the same persona."
+    );
     loop {
-        let turns = current_delta(cfg, persona)?;
+        let (turns, read_to) = read_delta(cfg, persona)?;
         if !turns.is_empty() {
             print_delta(&turns);
+            // Agent has been shown this delta — record the frontier so the `ack`
+            // it runs next consumes exactly this far, not past a turn that lands
+            // during its reply (the mid-turn-skip fix).
+            record_read_frontier(cfg, persona, read_to);
             return Ok(());
         }
         if timeout_secs > 0 && start.elapsed().as_secs() >= timeout_secs {
@@ -1747,6 +1884,12 @@ fn cmd_serve(
         "[spriff] serving {persona} on '{name}': invoking `{}` per peer turn (poll {poll}s, idle_timeout {idle_timeout}s){}",
         agent_cmd.join(" "),
         if mission.is_some() { " [drive-to-completion mission set]" } else { "" }
+    );
+    eprintln!(
+        "[spriff] mode: SEPARATE supervised child. This process re-invokes `{}`; it is not the \
+         already-open live chat/session. If the operator wanted that live session to be \
+         {persona}, stop this and use `spriff wait --as {persona}` there instead.",
+        agent_cmd.join(" ")
     );
 
     // Ironclad extras (config-driven, on by default): the inactivity watchdog and,
@@ -2149,10 +2292,72 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn resolve_program_with_path(program: &str, path_env: Option<&std::ffi::OsStr>) -> String {
+    let path = std::path::Path::new(program);
+    if path.is_absolute() || program.contains(std::path::MAIN_SEPARATOR) {
+        return program.to_string();
+    }
+    let Some(path_env) = path_env else {
+        return program.to_string();
+    };
+    for dir in std::env::split_paths(path_env) {
+        let candidate = dir.join(program);
+        if is_executable_file(&candidate) {
+            return candidate.display().to_string();
+        }
+    }
+    program.to_string()
+}
+
+fn resolve_program_for_supervisor(program: &str) -> String {
+    resolve_program_with_path(program, std::env::var_os("PATH").as_deref())
+}
+
+fn supervisor_env_from<F>(mut lookup: F) -> Vec<(String, String)>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    // Launch services run with a sparse environment (macOS launchd's default PATH
+    // is `/usr/bin:/bin:/usr/sbin:/sbin` and may omit HOME). Preserve only the
+    // non-secret process-level basics that make the re-invoked agent behave like
+    // the command the operator tested interactively; do not dump the full env.
+    ["SPRIFF_HOME", "HOME", "PATH"]
+        .into_iter()
+        .filter_map(|key| {
+            lookup(key)
+                .filter(|value| !value.is_empty())
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
+}
+
+fn supervisor_env() -> Vec<(String, String)> {
+    supervisor_env_from(|key| std::env::var(key).ok())
+}
+
 /// Render a launchd plist that runs `spriff` with `argv` under OS supervision.
 /// `RunAtLoad` + `KeepAlive` is what makes it TRULY ironclad: launchd starts it on
-/// login and respawns it if it ever exits. `env` is propagated so a custom
-/// `SPRIFF_HOME` still resolves the right board under the service. PURE + testable.
+/// login and respawns it if it ever exits. `env` carries the minimal runtime
+/// basics (`SPRIFF_HOME`/`HOME`/`PATH`) so the supervised agent resolves the same
+/// board, config, and tools the operator tested interactively. PURE + testable.
 fn launchd_plist(
     label: &str,
     argv: &[String],
@@ -2200,8 +2405,8 @@ fn launchd_plist(
 
 /// Render a systemd --user unit running `spriff` with `argv`. `Restart=always`
 /// plus the `[Install] WantedBy=default.target` (enable + linger) is the Linux
-/// equivalent of the ironclad launchd contract. `env` is propagated so a custom
-/// `SPRIFF_HOME` still resolves the right board. PURE + testable.
+/// equivalent of the ironclad launchd contract. `env` carries the same minimal
+/// runtime basics as launchd. PURE + testable.
 fn systemd_unit(
     name: &str,
     persona: &str,
@@ -2288,24 +2493,32 @@ fn cmd_supervise(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let label = label.unwrap_or_else(|| supervise_label(name, persona));
-    let argv = serve_argv(&spriff_bin, name, persona, config.as_deref(), agent_cmd);
+    let mut resolved_agent_cmd = agent_cmd.to_vec();
+    if let Some(program) = resolved_agent_cmd.first_mut() {
+        *program = resolve_program_for_supervisor(program);
+    }
+    let argv = serve_argv(
+        &spriff_bin,
+        name,
+        persona,
+        config.as_deref(),
+        &resolved_agent_cmd,
+    );
     let log_path = Sidecars::derive(&cfg.board_path(), persona)
         .log
         .with_extension("serve.log");
     let log = log_path.display().to_string();
-    // Propagate a custom SPRIFF_HOME so the boot-time service resolves the same
-    // registry/board the operator is using now (a plain `--collab` otherwise reads
-    // the default ~/.spriff under launchd/systemd).
-    let env: Vec<(String, String)> = std::env::var("SPRIFF_HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| vec![("SPRIFF_HOME".to_string(), h)])
-        .unwrap_or_default();
+    let env = supervisor_env();
 
     println!("spriff supervise — TRULY IRONCLAD subscription for {persona} on '{name}'");
     println!("================================================================\n");
     println!("This runs `spriff serve` under your OS service manager: it restarts on crash");
     println!("AND starts on login/boot — event-driven, no polling, no hand-rolled plist.\n");
+    println!("IMPORTANT: this creates a SEPARATE supervised agent process. It does NOT make");
+    println!("the already-open live chat/session become {persona}. If the operator wants");
+    println!("that live session to be {persona}, do not supervise; run:");
+    println!("    spriff wait --as {persona}");
+    println!("in that session instead.\n");
 
     if cfg!(target_os = "macos") {
         let plist = launchd_plist(&label, &argv, &workdir, &log, &env);
@@ -2494,9 +2707,9 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
     println!(
         "  subscribed: {}",
         if subscribed {
-            "yes — serve supervisor running (event-driven; you'll be re-invoked on each peer turn)"
+            "yes — separate `serve` supervisor running (the child agent command, not any live chat, is re-invoked on each peer turn)"
         } else {
-            "NO — not under `spriff serve`. Subscribe: `spriff supervise --as <you> -- <agent-cmd>`"
+            "no — expected for an interactive `spriff wait` loop; for a separate autonomous agent use `spriff supervise --as <you> -- <agent-cmd>`"
         }
     );
     // Inactivity watchdog.
@@ -3090,6 +3303,52 @@ mod tests {
         assert_eq!(
             supervise_label("Fix Checkout Flow!", "Pamela"),
             "spriff.fix-checkout-flow.pamela"
+        );
+    }
+
+    #[test]
+    fn supervisor_resolves_bare_agent_binary_before_launchd_gets_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "spriff-supervise-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = dir.join("agent-cli");
+        std::fs::write(&agent, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&agent).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&agent, perms).unwrap();
+        }
+
+        let resolved = resolve_program_with_path("agent-cli", Some(dir.as_os_str()));
+
+        assert_eq!(resolved, agent.display().to_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn supervisor_env_keeps_only_runtime_basics() {
+        let env = supervisor_env_from(|key| match key {
+            "SPRIFF_HOME" => Some("/tmp/spriff-home".to_string()),
+            "HOME" => Some("/Users/example".to_string()),
+            "PATH" => Some("/opt/homebrew/bin:/usr/bin".to_string()),
+            _ => Some("secret".to_string()),
+        });
+
+        assert_eq!(
+            env,
+            vec![
+                ("SPRIFF_HOME".to_string(), "/tmp/spriff-home".to_string()),
+                ("HOME".to_string(), "/Users/example".to_string()),
+                ("PATH".to_string(), "/opt/homebrew/bin:/usr/bin".to_string()),
+            ]
         );
     }
 

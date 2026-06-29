@@ -334,6 +334,78 @@ fn turn_delta_post_inbox_ack_and_no_self_wake() {
 }
 
 // ---------------------------------------------------------------------------
+// Mid-turn race: a peer turn that lands AFTER the reviewer reads its inbox but
+// BEFORE it acks must NOT be swallowed by the ack. This locks the fix for the
+// real "there were posts but the supervised agent never reacted" bug: `ack`
+// must advance the consume cursor only to the agent's READ FRONTIER, never to
+// the live board end.
+// ---------------------------------------------------------------------------
+#[test]
+fn ack_does_not_swallow_a_turn_that_arrived_after_the_read() {
+    let sb = Sandbox::new("ackrace");
+    let a = sb.cwd("impl");
+    let b = sb.cwd("rev");
+    assert!(sb
+        .run(&a, &["join", "--role", "implementer", "--project", "race"])
+        .status
+        .success());
+    assert!(sb
+        .run(&b, &["join", "--role", "reviewer", "--project", "race"])
+        .status
+        .success());
+
+    // T1: Abbey posts turn A.
+    assert!(sb
+        .run_stdin(
+            &a,
+            &["post", "--as", "Abbey", "-s", "turn-A", "--status", "FYI"],
+            "alpha body AAA\n",
+        )
+        .status
+        .success());
+
+    // T2: Alice reads her inbox and SEES turn A (this records her read frontier).
+    let ib_a = stdout(&sb.run(&b, &["inbox", "--as", "Alice"]));
+    assert!(
+        ib_a.contains("turn-A") && ib_a.contains("alpha body AAA"),
+        "Alice should see turn A:\n{ib_a}"
+    );
+
+    // T3: the race — Abbey posts turn B while Alice is "working" on A, BEFORE her ack.
+    assert!(sb
+        .run_stdin(
+            &a,
+            &["post", "--as", "Abbey", "-s", "turn-B", "--status", "FYI"],
+            "bravo body BBB\n",
+        )
+        .status
+        .success());
+
+    // T4: Alice acks. She only ever saw A, so the ack must consume A but NOT B.
+    assert!(sb.run(&b, &["ack", "--as", "Alice"]).status.success());
+
+    // T5: turn B must STILL be unread for Alice (the bug was that it vanished).
+    let ib_b = stdout(&sb.run(&b, &["inbox", "--as", "Alice"]));
+    assert!(
+        ib_b.contains("turn-B") && ib_b.contains("bravo body BBB"),
+        "REGRESSION: turn B that arrived after the read but before the ack was swallowed:\n{ib_b}"
+    );
+    // And turn A must be gone (the ack genuinely consumed what was seen).
+    assert!(
+        !ib_b.contains("alpha body AAA"),
+        "turn A should have been consumed by the ack:\n{ib_b}"
+    );
+
+    // T6: after reading B and acking again, the inbox is finally clear.
+    assert!(sb.run(&b, &["ack", "--as", "Alice"]).status.success());
+    let ib_c = stdout(&sb.run(&b, &["inbox", "--as", "Alice"]));
+    assert!(
+        !ib_c.contains("bravo body BBB") && ib_c.contains("inbox clear"),
+        "after reading + acking B the inbox should be clear:\n{ib_c}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 6. Alice's case: two agents launched at the SAME instant from the same prompt
 //    text must converge on ONE board with consistent identities. This is the
 //    create/join race around `created = !config_path.exists()`; it passes only
@@ -759,4 +831,145 @@ fn supervise_prints_a_serve_wrapping_unit_without_installing() {
         ],
     );
     assert!(!bad.status.success(), "off-roster supervise should fail");
+}
+
+// ---------------------------------------------------------------------------
+// 15. The foreground/operator-steered `wait` loop must not silently race a
+//     separate supervised child for the same persona. This was the confusing
+//     "which Punchyman is actually watching?" failure mode: if `serve` is already
+//     subscribed, `wait` now refuses unless the operator explicitly opts into the
+//     duplicate-agent risk.
+// ---------------------------------------------------------------------------
+#[test]
+fn wait_refuses_when_same_persona_is_already_supervised() {
+    let sb = Sandbox::new("wait-supervised");
+    let cwd = sb.cwd("op");
+    let o = sb.run(&cwd, &["init", "waitsup", "--agents", "2", "--letter", "a"]);
+    assert!(o.status.success(), "init failed: {}", stderr(&o));
+
+    let mut serve = sb
+        .cmd(
+            &cwd,
+            &[
+                "serve",
+                "--collab",
+                "waitsup",
+                "--as",
+                "Alice",
+                "--no-kickoff",
+                "--idle-timeout",
+                "30",
+                "--poll",
+                "1",
+                "--",
+                "echo",
+                "unused",
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+
+    let subscribed = (0..60).any(|_| {
+        let s = sb.run(&cwd, &["status", "--collab", "waitsup", "--as", "Alice"]);
+        if stdout(&s).contains("subscribed: yes") {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(subscribed, "serve never acquired the persona lock");
+
+    let blocked = sb.run(
+        &cwd,
+        &[
+            "wait",
+            "--collab",
+            "waitsup",
+            "--as",
+            "Alice",
+            "--timeout",
+            "1",
+        ],
+    );
+    assert!(
+        !blocked.status.success(),
+        "wait should refuse while serve owns this persona"
+    );
+    let err = stderr(&blocked);
+    assert!(
+        err.contains("CURRENT-session") && err.contains("separate `spriff serve` supervisor"),
+        "error must explain the foreground-vs-supervised split:\n{err}"
+    );
+
+    let allowed = sb.run(
+        &cwd,
+        &[
+            "wait",
+            "--collab",
+            "waitsup",
+            "--as",
+            "Alice",
+            "--timeout",
+            "1",
+            "--allow-while-supervised",
+        ],
+    );
+    assert_eq!(
+        allowed.status.code(),
+        Some(2),
+        "override should bypass the duplicate-agent guard and then time out"
+    );
+    assert!(
+        stderr(&allowed).contains("interactive wait-loop armed"),
+        "override path should still identify itself as the current-session loop"
+    );
+
+    let _ = serve.kill();
+    let _ = serve.wait();
+}
+
+// ---------------------------------------------------------------------------
+// 16. spriff is meant to be composed in shell loops. Piping a verbose command
+//     into `grep -q` closes stdout as soon as grep finds a match; that must not
+//     print Rust's broken-pipe panic noise to stderr.
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn status_pipe_to_grep_q_does_not_emit_broken_pipe_panic() {
+    let sb = Sandbox::new("pipe");
+    let cwd = sb.cwd("op");
+    let o = sb.run(
+        &cwd,
+        &["init", "pipetest", "--agents", "2", "--letter", "a"],
+    );
+    assert!(o.status.success(), "init failed: {}", stderr(&o));
+
+    let pipe_err = sb.root.join("pipe.err");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "\"$SPRIFF_BIN\" status --collab pipetest --as Alice 2>\"$PIPE_ERR\" | grep -q '^collaboration:'",
+        )
+        .env("SPRIFF_HOME", &sb.root)
+        .env("SPRIFF_BIN", bin())
+        .env("PIPE_ERR", &pipe_err)
+        .env_remove("SPRIFF_COLLAB")
+        .env_remove("SPRIFF_AS")
+        .env_remove("SPRIFF_CONFIG")
+        .current_dir(&cwd)
+        .status()
+        .expect("run status|grep");
+    assert!(
+        status.success(),
+        "pipeline should match the first status line"
+    );
+
+    let err = std::fs::read_to_string(&pipe_err).unwrap_or_default();
+    assert!(
+        !err.contains("panicked") && !err.contains("Broken pipe"),
+        "closed stdout pipe must be quiet, got stderr:\n{err}"
+    );
 }

@@ -85,11 +85,13 @@ pub struct RollupConfig {
     pub keep_recent_turns: usize,
 }
 
-/// Ironclad-by-default: present `spriff serve` (the supervisor that re-invokes the
-/// agent every turn and survives a stop/timeout/crash) as the PRIMARY way to run a
-/// side, not an opt-in. The flag doesn't force a behavior on an unsupervised run —
-/// it tells `join`/`doctor` to lead with the supervised path and frame the manual
-/// `wait`-loop as the fallback. Set false to flip that framing back.
+/// Ironclad-by-default: surface `spriff serve`/`supervise` (the supervisor that
+/// re-invokes a SEPARATE child agent every turn and survives a stop/timeout/crash)
+/// as the built-in autonomous mode, not a hand-rolled afterthought. The flag
+/// doesn't force a behavior on an interactive run — `join` still makes the agent
+/// choose whether THIS live session is the persona (`wait` loop) or a separate
+/// supervised child is. Set false to make the manual `wait` loop the primary
+/// framing in onboarding text.
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoopConfig {
     #[serde(default = "default_true")]
