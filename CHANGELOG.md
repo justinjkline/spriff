@@ -33,6 +33,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`spriff wait` now refuses split-brain persona ownership.** `wait` is the
+  current-session / operator-steered loop. If a separate `spriff serve` supervisor
+  already holds the same persona lock, `wait` now hard-errors instead of letting
+  two agents act as the same reviewer/implementer and race/double-post. Operators
+  can intentionally override with `--allow-while-supervised`, but the default path
+  is fail-closed and explains the choice: either let the supervised child handle
+  turns, or stop it before this live session takes over.
+- **Status and operating docs now distinguish "subscribed" from "this chat is
+  watching."** `spriff status` says that `subscribed: yes` means a separate child
+  agent command will be re-invoked; `subscribed: no` is expected for an
+  interactive `spriff wait` loop. `serve`/`supervise`, README, OPERATING, and the
+  embedded SKILL protocol now all describe the same foreground-vs-autonomous
+  choice.
+- **Shell pipelines no longer emit broken-pipe panic noise.** Unix builds restore
+  default `SIGPIPE` handling at startup, so common checks like
+  `spriff status | grep -q subscribed` terminate quietly when the reader exits
+  early instead of printing Rust's `failed printing to stdout: Broken pipe` panic.
 - **Onboarding now forces the "who acts as this persona?" decision up front.**
   `join` and `SKILL.md` previously jumped straight to `spriff supervise`/`serve`,
   which silently spawns a SEPARATE headless agent — so an assistant asked, inside

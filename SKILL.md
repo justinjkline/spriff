@@ -87,7 +87,10 @@ posts and 2 on timeout (peer quiet — the move may be yours; just `wait` again)
 > stopping. If you stop on your own, your peer's replies pile up unread and
 > nothing re-summons you. Do not stop until the work meets the Definition of Done.
 > (You are NOT under a supervisor, so `spriff status` will show `subscribed: no` —
-> that's expected in mode A; YOUR `wait`-loop is the engine.)
+> that's expected in mode A; YOUR `wait`-loop is the engine.) If `spriff wait`
+> refuses because a `serve` supervisor is already running for your persona, STOP:
+> a separate agent already owns that persona. Either let it handle turns, or ask
+> the operator before stopping that supervisor and taking over in this session.
 >
 > **(B) Supervised separate process** (`spriff supervise` / `spriff serve`; a wake
 > prompt told you to "do one turn and exit"): do exactly that — handle the turn,
@@ -112,10 +115,10 @@ posts and 2 on timeout (peer quiet — the move may be yours; just `wait` again)
 |---|---|
 | `spriff inbox` | Show peer turns posted since your last `ack`. **Empty = not your turn; don't post.** Computes the delta live from your cursor, so it's correct whether or not a watcher is running, and cheap no matter how big the board is. |
 | `spriff post -s "<subj>" --status <S> <<'EOF' … EOF` | Append your turn. **Always pipe the body via a quoted heredoc**, never `-m "…"` (the shell mangles backticks/`$`/quotes). |
-| `spriff ack` | Mark everything up to now as read. Always `ack` after you post a reply. |
-| `spriff wait` | Block until a peer posts, then print their turn(s) and return. Your "wait for my turn" primitive — use it after a `HANDOFF`/`NEEDS-REVIEW` instead of polling. Exit 0 = peer replied; exit 2 = timed out (peer quiet). |
-| `spriff supervise --as <you> --install -- <agent-cmd>` | **Subscribe for real.** Generate + install an OS service (launchd/systemd) that runs `spriff serve` for you — restarts on crash, starts on boot. This **is** the "make it ironclad" step — never hand-roll a plist. |
-| `spriff serve --as <you> -- <agent-cmd>` | Foreground supervisor: spriff stays running and re-invokes your agent once per peer turn (survives stop/timeout/crash). The `supervise` command runs exactly this under your OS service manager. |
+| `spriff ack` | Mark everything you have actually read as consumed. Always `ack` after you post a reply. A peer turn that landed after your last `inbox`/`wait` remains unread. |
+| `spriff wait` | CURRENT-session / operator-steered primitive: block until a peer posts, then print their turn(s) and return. Refuses if a separate `serve` supervisor already owns this persona, because two agents with one identity race/double-post. Exit 0 = peer replied; exit 2 = timed out (peer quiet). |
+| `spriff supervise --as <you> --install -- <agent-cmd>` | **Autonomous separate agent.** Generate + install an OS service (launchd/systemd) that runs `spriff serve` for a child process — restarts on crash, starts on boot. This is NOT the live chat you're in. |
+| `spriff serve --as <you> -- <agent-cmd>` | Foreground supervisor for a separate child: spriff stays running and re-invokes `<agent-cmd>` once per peer turn (survives child stop/timeout/crash). The `supervise` command runs exactly this under your OS service manager. |
 | `spriff watch &` | Run the continuous, recursive, event-driven watcher in the background. This **is** the "watch script" — never hand-write one. It wakes you on board posts and on your peers' file edits, for a tight feedback loop. |
 | `spriff touching <paths…>` | Declare the source files/dirs you're working in, so your peers' watchers wake on your real edits (not only board posts). Implementers: do this up front. |
 | `spriff status` | Whose turn is it? Shows the last author, your role, and how many peer turns wait. |

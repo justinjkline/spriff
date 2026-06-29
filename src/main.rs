@@ -248,7 +248,7 @@ enum Cmd {
 
     /// Block until a peer posts (your inbox becomes non-empty), then print the
     /// delta and exit 0. Exits 2 on timeout. This is the natural "wait for my
-    /// turn" primitive for a CLI agent loop.
+    /// turn" primitive for the CURRENT interactive CLI agent loop.
     Wait {
         #[arg(long)]
         collab: Option<String>,
@@ -262,6 +262,11 @@ enum Cmd {
         /// Poll interval in seconds.
         #[arg(long, default_value_t = 2)]
         interval: u64,
+        /// Advanced: allow waiting even when a separate `serve` supervisor is
+        /// already running for this persona. Normally refused to prevent two
+        /// agents with the same identity racing/double-posting.
+        #[arg(long)]
+        allow_while_supervised: bool,
     },
 
     /// Declare source paths you're touching, so your peers' watchers wake on your
@@ -321,7 +326,20 @@ enum Cmd {
     },
 }
 
+fn restore_default_sigpipe() {
+    // Rust ignores SIGPIPE by default and turns an early-closing stdout consumer
+    // (`spriff status | grep -q …`) into a noisy "failed printing to stdout:
+    // Broken pipe" panic. spriff is a shell-native coordination CLI, so Unix
+    // pipeline composition should behave like standard tools: terminate quietly
+    // when the reader is done.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> Result<()> {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Join {
@@ -465,10 +483,11 @@ fn main() -> Result<()> {
             as_persona,
             timeout,
             interval,
+            allow_while_supervised,
         } => {
             let (cfg, _name) = resolve(collab, config)?;
             let persona = resolve_persona(as_persona, &cfg);
-            cmd_wait(&cfg, &persona, timeout, interval)
+            cmd_wait(&cfg, &persona, timeout, interval, allow_while_supervised)
         }
         Cmd::Touching {
             paths,
@@ -1467,6 +1486,12 @@ fn cmd_join(
         println!("\nConfirm a (B) subscription anytime: `spriff status --as {me}` (\"subscribed: yes\").");
         println!("In mode (A) `subscribed: no` is EXPECTED — your own `wait`-loop is the engine.");
         println!(
+            "If mode (A)'s `spriff wait --as {me}` refuses because a supervisor is already running,"
+        );
+        println!(
+            "do NOT run two {me}s. Let the separate agent work, or stop it before this session takes over."
+        );
+        println!(
             "\n═══════════ YOUR JOB — (A) run the loop below · (B) one turn per wake ═══════════"
         );
     } else {
@@ -1765,10 +1790,29 @@ fn cmd_touching(cfg: &Config, persona: &str, paths: &[PathBuf]) -> Result<()> {
 
 /// Block until a peer posts (the delta becomes non-empty), then print it. Exits
 /// 0 on a peer turn, 2 on timeout. The natural "wait for my turn" agent primitive.
-fn cmd_wait(cfg: &Config, persona: &str, timeout_secs: u64, interval_secs: u64) -> Result<()> {
+fn cmd_wait(
+    cfg: &Config,
+    persona: &str,
+    timeout_secs: u64,
+    interval_secs: u64,
+    allow_while_supervised: bool,
+) -> Result<()> {
+    if !allow_while_supervised && is_serve_running(&cfg.board_path(), persona) {
+        anyhow::bail!(
+            "`spriff wait` is the CURRENT-session / operator-steered loop, but a separate \
+             `spriff serve` supervisor is already running for {persona}. Do not run two agents \
+             as the same persona: either let the supervised child handle turns, or stop that \
+             supervisor first and then run `spriff wait --as {persona}` here. If you are only \
+             inspecting and explicitly accept the duplicate-agent risk, re-run with \
+             --allow-while-supervised."
+        );
+    }
     let start = Instant::now();
     let interval = Duration::from_secs(interval_secs.max(1));
-    eprintln!("[spriff] waiting for a peer turn as {persona}…");
+    eprintln!(
+        "[spriff] interactive wait-loop armed as {persona}; this command notifies THIS session. \
+         Do not also run `spriff serve`/`supervise` for the same persona."
+    );
     loop {
         let (turns, read_to) = read_delta(cfg, persona)?;
         if !turns.is_empty() {
@@ -1840,6 +1884,12 @@ fn cmd_serve(
         "[spriff] serving {persona} on '{name}': invoking `{}` per peer turn (poll {poll}s, idle_timeout {idle_timeout}s){}",
         agent_cmd.join(" "),
         if mission.is_some() { " [drive-to-completion mission set]" } else { "" }
+    );
+    eprintln!(
+        "[spriff] mode: SEPARATE supervised child. This process re-invokes `{}`; it is not the \
+         already-open live chat/session. If the operator wanted that live session to be \
+         {persona}, stop this and use `spriff wait --as {persona}` there instead.",
+        agent_cmd.join(" ")
     );
 
     // Ironclad extras (config-driven, on by default): the inactivity watchdog and,
@@ -2464,6 +2514,11 @@ fn cmd_supervise(
     println!("================================================================\n");
     println!("This runs `spriff serve` under your OS service manager: it restarts on crash");
     println!("AND starts on login/boot — event-driven, no polling, no hand-rolled plist.\n");
+    println!("IMPORTANT: this creates a SEPARATE supervised agent process. It does NOT make");
+    println!("the already-open live chat/session become {persona}. If the operator wants");
+    println!("that live session to be {persona}, do not supervise; run:");
+    println!("    spriff wait --as {persona}");
+    println!("in that session instead.\n");
 
     if cfg!(target_os = "macos") {
         let plist = launchd_plist(&label, &argv, &workdir, &log, &env);
@@ -2652,9 +2707,9 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
     println!(
         "  subscribed: {}",
         if subscribed {
-            "yes — serve supervisor running (event-driven; you'll be re-invoked on each peer turn)"
+            "yes — separate `serve` supervisor running (the child agent command, not any live chat, is re-invoked on each peer turn)"
         } else {
-            "NO — not under `spriff serve`. Subscribe: `spriff supervise --as <you> -- <agent-cmd>`"
+            "no — expected for an interactive `spriff wait` loop; for a separate autonomous agent use `spriff supervise --as <you> -- <agent-cmd>`"
         }
     );
     // Inactivity watchdog.

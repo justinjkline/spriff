@@ -492,6 +492,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
+ "libc",
  "notify",
  "serde",
  "toml",
