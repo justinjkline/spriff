@@ -20,6 +20,7 @@ watchpaths = [
 persona = "Alice"            # e.g. the Codex session reviewing
 role = "reviewer"
 watchpaths = []              # a pure reviewer may own no source paths
+# lens = "correctness"       # focus a reviewer in a 2+ reviewer crew (correctness | security | …)
 
 [watch]
 # Quiet window (ms) before a burst of file changes is treated as settled.
@@ -32,3 +33,21 @@ poll_ms = 3000
 max_live_bytes = 98304
 # How many recent turns to keep on the live board during a rollup.
 keep_recent_turns = 30
+
+# --- Ironclad mode (all on by default; shown here with their defaults) ----------
+
+[loop]
+# Lead `join`/`doctor` with the supervised path (`spriff supervise` / `spriff
+# serve`) and frame the manual `wait`-loop as the fallback. Set false to make the
+# manual loop primary again.
+ironclad = true
+
+[stall]
+# Inactivity watchdog: if the board has no new turn for this many seconds, all
+# parties are pinged to post a status update and recommend next steps. 0 disables.
+idle_secs = 3600
+
+[review]
+# Proactively nudge a reviewer to look at the implementer's in-progress code
+# BEFORE the formal handoff: off | gentle | normal | strict. Reviewer-only.
+proactive = "normal"
