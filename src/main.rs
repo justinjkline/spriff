@@ -248,7 +248,10 @@ enum Cmd {
 
     /// Block until a peer posts (your inbox becomes non-empty), then print the
     /// delta and exit 0. Exits 2 on timeout. This is the natural "wait for my
-    /// turn" primitive for the CURRENT interactive CLI agent loop.
+    /// turn" primitive for the CURRENT interactive CLI agent loop. Pass `--once`
+    /// for a single NON-BLOCKING poll instead (exit 0 = new turns printed, exit 2
+    /// = nothing new) — the right primitive for a chat-driven agent that is
+    /// re-invoked each turn and must not burn time/tokens blocking.
     Wait {
         #[arg(long)]
         collab: Option<String>,
@@ -262,6 +265,13 @@ enum Cmd {
         /// Poll interval in seconds.
         #[arg(long, default_value_t = 2)]
         interval: u64,
+        /// Non-blocking: check the inbox exactly ONCE and exit immediately —
+        /// exit 0 (new peer turn(s), printed) or exit 2 (nothing new). No sleep,
+        /// no loop. Ignores --timeout/--interval. This is the cheap per-turn poll
+        /// for an agent that is re-invoked each turn (e.g. a chat session) and
+        /// must not block: run it once when you act, branch on the exit code.
+        #[arg(long)]
+        once: bool,
         /// Advanced: allow waiting even when a separate `serve` supervisor is
         /// already running for this persona. Normally refused to prevent two
         /// agents with the same identity racing/double-posting.
@@ -483,11 +493,19 @@ fn main() -> Result<()> {
             as_persona,
             timeout,
             interval,
+            once,
             allow_while_supervised,
         } => {
             let (cfg, _name) = resolve(collab, config)?;
             let persona = resolve_persona(as_persona, &cfg);
-            cmd_wait(&cfg, &persona, timeout, interval, allow_while_supervised)
+            cmd_wait(
+                &cfg,
+                &persona,
+                timeout,
+                interval,
+                once,
+                allow_while_supervised,
+            )
         }
         Cmd::Touching {
             paths,
@@ -1733,7 +1751,10 @@ fn print_delta(turns: &[board::Turn]) {
     println!("    EOF");
     println!("Ack:      spriff ack");
     println!(
-        "Continue: spriff wait        # ⟳ STAY IN THE LOOP — do NOT stop until the work is DONE"
+        "Continue (interactive, blocks):     spriff wait          # ⟳ STAY IN THE LOOP until DONE"
+    );
+    println!(
+        "Continue (re-invoked each turn):    spriff wait --once   # cheap NON-BLOCKING poll: exit 0=new, 2=nothing"
     );
 }
 
@@ -1790,11 +1811,20 @@ fn cmd_touching(cfg: &Config, persona: &str, paths: &[PathBuf]) -> Result<()> {
 
 /// Block until a peer posts (the delta becomes non-empty), then print it. Exits
 /// 0 on a peer turn, 2 on timeout. The natural "wait for my turn" agent primitive.
+///
+/// With `once = true` it does NOT block: it checks the inbox exactly once and
+/// returns immediately — exit 0 (new turn(s), printed) or exit 2 (nothing new).
+/// That is the right primitive for an agent that is re-invoked each turn (a chat
+/// session, a supervised wake): poll once when you act and branch on the exit
+/// code, instead of holding a blocking process open and burning time/tokens. It
+/// records the read frontier exactly like the blocking path, so a later `ack`
+/// consumes precisely what was shown and never a turn that lands afterward.
 fn cmd_wait(
     cfg: &Config,
     persona: &str,
     timeout_secs: u64,
     interval_secs: u64,
+    once: bool,
     allow_while_supervised: bool,
 ) -> Result<()> {
     if !allow_while_supervised && is_serve_running(&cfg.board_path(), persona) {
@@ -1806,6 +1836,23 @@ fn cmd_wait(
              inspecting and explicitly accept the duplicate-agent risk, re-run with \
              --allow-while-supervised."
         );
+    }
+    // Non-blocking single poll: the cheap per-turn check. Exactly one read, then
+    // exit — 0 if there's a peer delta (printed + frontier recorded), 2 if not.
+    // No banner, no sleep, no loop: an agent re-invoked each turn runs THIS, sees
+    // anything new instantly, and never holds a blocking process open.
+    if once {
+        let (turns, read_to) = read_delta(cfg, persona)?;
+        if !turns.is_empty() {
+            print_delta(&turns);
+            record_read_frontier(cfg, persona, read_to);
+            return Ok(());
+        }
+        eprintln!(
+            "[spriff] nothing new for {persona} right now (non-blocking poll, exit 2). \
+             Re-run `spriff wait --once --as {persona}` next time you act."
+        );
+        std::process::exit(2);
     }
     let start = Instant::now();
     let interval = Duration::from_secs(interval_secs.max(1));

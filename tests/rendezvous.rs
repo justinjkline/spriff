@@ -973,3 +973,93 @@ fn status_pipe_to_grep_q_does_not_emit_broken_pipe_panic() {
         "closed stdout pipe must be quiet, got stderr:\n{err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 17. `wait --once` is the NON-BLOCKING per-turn poll for a chat-driven agent:
+//     it checks the inbox exactly once and exits immediately — 0 with the delta
+//     printed when a peer turn is waiting, 2 when nothing is new. It must NOT
+//     block, and it must record the read frontier so a later `ack` consumes
+//     exactly what was shown (never a turn that lands afterward).
+// ---------------------------------------------------------------------------
+#[test]
+fn wait_once_is_nonblocking_and_exit_coded() {
+    let sb = Sandbox::new("wait-once");
+    let a = sb.cwd("impl");
+    let b = sb.cwd("rev");
+    assert!(sb
+        .run(
+            &a,
+            &["join", "--role", "implementer", "--project", "once demo"]
+        )
+        .status
+        .success());
+    assert!(sb
+        .run(
+            &b,
+            &["join", "--role", "reviewer", "--project", "once demo"]
+        )
+        .status
+        .success());
+
+    // Nothing posted yet → a single non-blocking poll returns immediately with
+    // exit code 2 (and does not hang). We give it a hard cap via the test harness
+    // by simply running it: if it blocked, the suite would stall here.
+    let empty = sb.run(&b, &["wait", "--once", "--as", "Alice"]);
+    assert_eq!(
+        empty.status.code(),
+        Some(2),
+        "an empty non-blocking poll must exit 2, got {:?}\nstderr:\n{}",
+        empty.status.code(),
+        stderr(&empty)
+    );
+    assert!(
+        !stdout(&empty).contains("new turn(s) since your last ack"),
+        "empty poll must not print a delta:\n{}",
+        stdout(&empty)
+    );
+
+    // Implementer posts → the very next non-blocking poll returns exit 0 and
+    // prints the delta.
+    assert!(sb
+        .run_stdin(
+            &a,
+            &[
+                "post",
+                "--as",
+                "Abbey",
+                "-s",
+                "once-turn",
+                "--status",
+                "FYI"
+            ],
+            "once body ZZZ\n",
+        )
+        .status
+        .success());
+
+    let hit = sb.run(&b, &["wait", "--once", "--as", "Alice"]);
+    assert_eq!(
+        hit.status.code(),
+        Some(0),
+        "a non-blocking poll with a waiting turn must exit 0, got {:?}\nstderr:\n{}",
+        hit.status.code(),
+        stderr(&hit)
+    );
+    assert!(
+        stdout(&hit).contains("once-turn") && stdout(&hit).contains("once body ZZZ"),
+        "the poll must print the waiting delta:\n{}",
+        stdout(&hit)
+    );
+
+    // The poll recorded the read frontier, so a plain `ack` now consumes exactly
+    // what was shown and the next poll is clean (exit 2) — proving the one-shot
+    // path shares the mid-turn-skip-safe frontier semantics of inbox/wait.
+    assert!(sb.run(&b, &["ack", "--as", "Alice"]).status.success());
+    let after = sb.run(&b, &["wait", "--once", "--as", "Alice"]);
+    assert_eq!(
+        after.status.code(),
+        Some(2),
+        "after ack the next non-blocking poll must be clean (exit 2), got {:?}",
+        after.status.code()
+    );
+}

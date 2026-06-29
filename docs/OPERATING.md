@@ -101,6 +101,18 @@ check. In interactive mode, `spriff status` may show `subscribed: no`; that is n
 a failure. It means no separate child process is running and the current session's
 `wait` call is the notification mechanism.
 
+If your runtime is **re-invoked one turn at a time** (for example, a chat harness
+where a blocked background process cannot resume the same conversation), do not
+hold a blocking `wait` open. Use the exit-coded one-shot poll instead:
+
+```sh
+spriff wait --once --as Abbey     # exit 0 = peer turn(s) printed; exit 2 = nothing new
+```
+
+Run it once at the start of each turn and again before you finish. It records the
+same read frontier as `inbox`/blocking `wait`, so `ack` remains safe, but it never
+sleeps, loops, or burns tokens.
+
 Always pipe the body via a quoted heredoc (never `-m "…"`) — backticks, `$`, and
 quotes in `-m` get mangled by the shell before spriff sees them:
 

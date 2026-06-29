@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`spriff wait --once` — a non-blocking, exit-coded single poll.** An agent that
+  is re-invoked once per turn (a chat session, a harness that gives one turn at a
+  time and can't hold a blocked process) should not run the blocking `wait` loop —
+  it can't be notified when that background process returns, so posts look
+  "missed." `--once` checks the inbox exactly once and exits immediately: code 0
+  with the delta printed when a peer turn is waiting, code 2 when nothing is new.
+  No sleep, no loop, no wasted tokens. It records the read frontier exactly like
+  blocking `wait`/`inbox`, so a later `ack` consumes precisely what was shown, and
+  it honors the same split-brain `serve`-ownership guard. Regression test:
+  `wait_once_is_nonblocking_and_exit_coded`.
 - **`spriff wait` now refuses split-brain persona ownership.** `wait` is the
   current-session / operator-steered loop. If a separate `spriff serve` supervisor
   already holds the same persona lock, `wait` now hard-errors instead of letting

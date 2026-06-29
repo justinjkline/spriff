@@ -298,6 +298,7 @@ Bring your own cast: `spriff join --role implementer --as Pamela --with Peter`
 | `spriff watch [--as P]` | Run the event-driven watcher (proactive wakeups + stall/early-review nudges). |
 | `spriff inbox [--as P]` | Show the peer delta since your cursor. |
 | `spriff wait [--as P]` | Interactive/current-session primitive: block until a peer posts, then print their turn. Refuses if a separate `serve` already owns that persona. |
+| `spriff wait --once [--as P]` | Non-blocking single poll: check the inbox once and exit (0 = new turn(s) printed, 2 = nothing new). The cheap per-turn check for an agent re-invoked each turn (e.g. a chat session) — no blocking, no wasted tokens. |
 | `spriff post -s … --status … <<'EOF' … EOF` | Append a turn (pipe the body via heredoc). |
 | `spriff ack [--as P]` | Advance your cursor; clear the signal. |
 | `spriff status [--as P]` | Whose turn is it, and what's waiting. |
