@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interactive `spriff wait` loop. `serve`/`supervise`, README, OPERATING, and the
   embedded SKILL protocol now all describe the same foreground-vs-autonomous
   choice.
+- **Agent docs now spell out the current-session wait loop.** The README,
+  OPERATING guide, and embedded SKILL protocol make the working interactive mode
+  explicit: run foreground `spriff wait --as <persona> --timeout 600 --interval 2`,
+  handle/post/ack, then immediately re-arm. They also call out that `spriff watch`,
+  detached `wait`, and supervised children cannot notify or resume the live chat
+  the operator is steering.
 - **Shell pipelines no longer emit broken-pipe panic noise.** Unix builds restore
   default `SIGPIPE` handling at startup, so common checks like
   `spriff status | grep -q subscribed` terminate quietly when the reader exits
