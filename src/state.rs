@@ -17,7 +17,9 @@ pub struct WatchState {
     /// The header of the most recent pending we raised (dedup guard).
     pub last_pending_header: String,
     /// Byte offset of the board END as of the agent's most recent READ
-    /// (`inbox` / `wait` / `status`). This is the "read frontier": how far the
+    /// (`inbox` / `wait` — the commands that actually SHOW the agent its turns;
+    /// count-only pollers like `status`/`doctor` deliberately do NOT record it).
+    /// This is the "read frontier": how far the
     /// agent has actually been SHOWN. `ack` advances the consume cursor only to
     /// here, never to the live board end — so a peer turn that lands AFTER the
     /// agent's read but BEFORE its `ack` (the mid-turn race) is preserved as
