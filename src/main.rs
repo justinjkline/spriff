@@ -489,18 +489,40 @@ fn main() -> Result<()> {
             let persona = resolve_persona(as_persona, &cfg);
             let board_path = cfg.board_path();
             let sc = Sidecars::derive(&board_path, &persona);
-            // Advance the consume cursor to "everything up to now" and clear the
-            // dedup guard, so the same peer turns won't reappear in your inbox.
+            // Advance the consume cursor to the READ FRONTIER — the board end as
+            // of the agent's most recent `inbox`/`wait`/`status` — NOT the live
+            // board end. This is the fix for the mid-turn skip: a peer turn that
+            // landed AFTER the agent read its inbox but BEFORE this `ack` is at a
+            // byte offset beyond the frontier, so it survives as unread instead of
+            // being silently consumed. (Old behavior — `offset = board_size()` —
+            // jumped the cursor past such a turn, and under `serve` the supervisor
+            // then saw an empty delta and never re-invoked: a skipped beat.)
             let mut st = state::WatchState::load(&sc.state);
-            st.offset = board::board_size(&board_path);
+            let board_end = board::board_size(&board_path);
+            // Clamp a stale/over-large frontier to the live board, and never move
+            // the consume cursor BACKWARD (a frontier below an already-advanced
+            // offset — e.g. after a rollup remap — must not rewind the cursor).
+            let frontier = st.read_frontier.min(board_end);
+            st.offset = st.offset.max(frontier);
             st.last_pending_header = String::new();
             st.save(&sc.state)?;
             // Archive any proactive watcher signal (flag/pending/action) too.
             let archived = pending::ack(&sc)?;
-            if archived {
-                println!("acked — caught up; watcher signal archived. Inbox clear.");
+            // Tell the truth about whether anything is still unread: a turn that
+            // arrived mid-turn is now correctly retained, so report it instead of
+            // the old unconditional "Inbox clear".
+            let still_unread = board::delta_since(&board_path, st.offset, &persona)?.len();
+            let tail = if still_unread > 0 {
+                format!(
+                    " {still_unread} new peer turn(s) arrived since your last read — run `spriff inbox`."
+                )
             } else {
-                println!("acked — caught up. Inbox clear.");
+                " Inbox clear.".to_string()
+            };
+            if archived {
+                println!("acked — caught up to your last read; watcher signal archived.{tail}");
+            } else {
+                println!("acked — caught up to your last read.{tail}");
             }
             Ok(())
         }
@@ -1593,6 +1615,20 @@ fn cmd_post(
 /// The peer delta since this persona's cursor, computed LIVE — works whether or
 /// not a watcher is running.
 fn current_delta(cfg: &Config, persona: &str) -> Result<Vec<board::Turn>> {
+    Ok(read_delta(cfg, persona)?.0)
+}
+
+/// Read the unread peer delta AND report the exact board size it was read to.
+///
+/// The returned size is the byte offset just past the last turn included in the
+/// delta — i.e. the precise READ FRONTIER a subsequent `ack` may safely consume
+/// to. Callers that actually SHOW the turns to the agent (`inbox`, `wait`)
+/// persist that size via `record_read_frontier`, so a peer turn that lands after
+/// this read but before the agent's `ack` stays at a higher offset and is never
+/// swallowed. Pollers that only show a COUNT (`status`, `doctor`) or drive the
+/// supervisor loop call this WITHOUT recording a frontier, so they can never
+/// advance the consume cursor past content the agent has not seen.
+fn read_delta(cfg: &Config, persona: &str) -> Result<(Vec<board::Turn>, u64)> {
     let board_path = cfg.board_path();
     let sc = Sidecars::derive(&board_path, persona);
     let mut st = state::WatchState::load(&sc.state);
@@ -1606,7 +1642,29 @@ fn current_delta(cfg: &Config, persona: &str) -> Result<Vec<board::Turn>> {
         st.offset = size;
         let _ = st.save(&sc.state);
     }
-    board::delta_since(&board_path, st.offset, persona)
+    // `delta_since` reads to the board size AT ITS CALL; capture that same size so
+    // the frontier a caller records matches exactly what was returned (no
+    // time-of-check/use gap where a turn that arrived after this read is wrongly
+    // marked seen).
+    let read_to = board::board_size(&board_path);
+    let turns = board::delta_since(&board_path, st.offset, persona)?;
+    Ok((turns, read_to))
+}
+
+/// Persist the READ FRONTIER after the agent has actually been SHOWN the board up
+/// to `read_to`. Monotonic (never rewinds) and clamped to the live board so a
+/// stale frontier can't later consume past the end. Only the agent-facing read
+/// commands that print real turns call this; `ack` advances the consume cursor
+/// only as far as the frontier recorded here.
+fn record_read_frontier(cfg: &Config, persona: &str, read_to: u64) {
+    let board_path = cfg.board_path();
+    let sc = Sidecars::derive(&board_path, persona);
+    let mut st = state::WatchState::load(&sc.state);
+    let clamped = read_to.min(board::board_size(&board_path));
+    if clamped > st.read_frontier {
+        st.read_frontier = clamped;
+        let _ = st.save(&sc.state);
+    }
 }
 
 /// Print the captured peer turns plus the canonical "what to do next" footer.
@@ -1633,16 +1691,24 @@ fn print_delta(turns: &[board::Turn]) {
 
 fn cmd_inbox(cfg: &Config, persona: &str) -> Result<()> {
     let sc = Sidecars::derive(&cfg.board_path(), persona);
-    let turns = current_delta(cfg, persona)?;
+    let (turns, read_to) = read_delta(cfg, persona)?;
     if turns.is_empty() {
         if pending::is_raised(&sc) {
             println!("inbox clear — no new peer turns (stale watcher flag set; run `spriff ack` to clear).");
         } else {
             println!("inbox clear — no new peer turns. Not your turn.");
         }
+        // Even an empty read advances the frontier to "everything that exists now
+        // has been shown", so a later `ack` after an intervening peer post does
+        // not consume that post. (Harmless when nothing is unread.)
+        record_read_frontier(cfg, persona, read_to);
         return Ok(());
     }
     print_delta(&turns);
+    // The agent has now SEEN every turn in this delta. Record how far the read
+    // reached so `ack` consumes exactly this much and never a turn that arrives
+    // afterward (the mid-turn-skip fix).
+    record_read_frontier(cfg, persona, read_to);
     Ok(())
 }
 
@@ -1681,9 +1747,13 @@ fn cmd_wait(cfg: &Config, persona: &str, timeout_secs: u64, interval_secs: u64) 
     let interval = Duration::from_secs(interval_secs.max(1));
     eprintln!("[spriff] waiting for a peer turn as {persona}…");
     loop {
-        let turns = current_delta(cfg, persona)?;
+        let (turns, read_to) = read_delta(cfg, persona)?;
         if !turns.is_empty() {
             print_delta(&turns);
+            // Agent has been shown this delta — record the frontier so the `ack`
+            // it runs next consumes exactly this far, not past a turn that lands
+            // during its reply (the mid-turn-skip fix).
+            record_read_frontier(cfg, persona, read_to);
             return Ok(());
         }
         if timeout_secs > 0 && start.elapsed().as_secs() >= timeout_secs {

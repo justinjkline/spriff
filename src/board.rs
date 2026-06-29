@@ -645,6 +645,7 @@ mod tests {
         crate::state::WatchState {
             offset: cursor_before,
             last_pending_header: String::new(),
+            read_frontier: 0,
         }
         .save(&state)
         .unwrap();

@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `spriff ack` no longer swallows a peer turn that arrives mid-turn. Previously
+  `ack` advanced the consume cursor to the LIVE board end (`offset =
+  board_size()`), so a peer turn posted AFTER the agent read its inbox but BEFORE
+  it acked was leapfrogged and never resurfaced — and under `spriff serve` the
+  supervisor then computed an empty delta and never re-invoked the agent (a
+  silently skipped beat). `ack` now advances only to the agent's READ FRONTIER —
+  the board end as of its most recent `inbox`/`wait` — which `inbox`/`wait`
+  record when they actually show turns. A turn that lands after that read stays
+  unread. `status`/`doctor`/the serve completion-poll never move the frontier, so
+  read-only polling can't consume unseen turns. Regression test:
+  `ack_does_not_swallow_a_turn_that_arrived_after_the_read`.
 - `spriff supervise --install -- codex exec` / `claude -p` now resolves the agent
   binary through the operator's current `PATH` before writing the launchd/systemd
   service, and carries `HOME` + `PATH` into the service environment. macOS launchd
