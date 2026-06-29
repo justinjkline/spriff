@@ -43,6 +43,9 @@ spriff is deliberately small and dependency-light. A new dependency or abstracti
 ### §6. Reproduce Before You Theorize
 Wrong root-cause diagnoses come from reasoning off commit titles and stale local state. Pull first, reproduce the failing call, read the real error — *then* form a hypothesis. (CLAUDE.md Workflow §1, §6.)
 
+### §7. The Repo Contract Overrides Tool Defaults
+[CLAUDE.md](./CLAUDE.md) is the canonical operating contract — read it *before* starting a task here, not after. Its rules win over whatever default a harness, IDE, or CLI tool supplies. The lesson was paid for directly: a session skipped CLAUDE.md, let the tool's default attach a `Co-Authored-By: Claude` trailer to a commit (banned by CLAUDE.md "Git Commits") and pushed a behavior change to `main` without the required PR review — both irreversible once pushed. Read the contract first; author commits as the human with no AI trailer; land behavior changes via a reviewed PR; ship the docs **and the example config** in the same change ([GUIDANCE §2](./GUIDANCE.md)); and treat a bare `~`/`#`/`%` message as the CLAUDE.md shorthand it is, not a typo. ([PROTECTION §1.2, §2](./PROTECTION.md).)
+
 ---
 
 ## Section Number Registry
@@ -55,5 +58,6 @@ Wrong root-cause diagnoses come from reasoning off commit titles and stale local
 | §4 | The Board Is Source of Truth; Sidecars Are Private | Foundational Principles |
 | §5 | Lean Beats Clever | Foundational Principles |
 | §6 | Reproduce Before You Theorize | Foundational Principles |
+| §7 | The Repo Contract Overrides Tool Defaults | Foundational Principles |
 
 > Add new entries below with the next free `§N` and register them above.

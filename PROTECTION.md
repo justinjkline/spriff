@@ -30,6 +30,7 @@ make the dangerous thing hard, and to make it survivable when prevention fails.
 - Never amend or rewrite published commits without an explicit request.
 - Never skip hooks (`--no-verify`).
 - Create feature branches for non-trivial changes.
+- Land code/behavior changes through a **reviewed PR** — never push them straight to `main` (CLAUDE.md "Git Commits"; [CONTRIBUTING.md](./CONTRIBUTING.md)). A behavior change that reached `main` without a PR has skipped the review gate even if CI is green.
 
 ### 1.3 File Overwrite Protection
 - Always read a file before writing to it — prevents clobbering content you haven't seen.
@@ -47,6 +48,7 @@ Before deleting or overwriting any artifact, look at it. If what you find contra
 - Keep machine-specific values out of tracked files; use environment variables (e.g. `SPRIFF_HOME`) and `.gitignore`.
 - Report security issues through private reporting (see [SECURITY.md](./SECURITY.md)), never in a public issue or PR.
 - Assume every commit is permanent: a secret pushed and later removed is still in history and must be rotated.
+- **Commit authorship**: author as the human (e.g. Justin Kline); **strip the tool's default `Co-Authored-By: Claude` trailer and any "Generated with …" PR-body line** before committing/opening a PR (CLAUDE.md "Git Commits"). The trailer is irreversible once pushed — verify it's absent *before* the push, not after.
 
 ---
 

@@ -48,7 +48,8 @@ Before adding to any pillar: (1) read the relevant section, (2) check for redund
 2. **Respect the invariants** in [PROTECTION.md §3](./PROTECTION.md): the board is read-only to watchers, readers consume deltas not full rescans, deps stay lean.
 3. **Match the idiom**: same naming, structure, and comment density as the surrounding code — comment the *why*.
 4. **Test at the right level**: unit tests for grammar/cursor/rollup/naming logic; the `tests/rendezvous.rs` end-to-end suite for behavior that crosses the binary boundary.
-5. **Run the full local gate** before pushing (CLAUDE.md Workflow §5). It *is* the CI.
+5. **Update every doc surface in the SAME change** — not just the prose. A new flag/command updates `SKILL.md` and `--help`; a board-format change updates `docs/BOARD-GRAMMAR.md`; a **new config knob updates `examples/example-collab.toml`**; any user-visible change updates `CHANGELOG.md`. A stale doc/example is a latent bug ([PROTECTION §4](./PROTECTION.md)); shipping the feature without it is half-done.
+6. **Run the full local gate** before pushing (CLAUDE.md Workflow §5). It *is* the CI.
 
 ---
 
