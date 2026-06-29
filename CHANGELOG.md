@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: copy-paste onboarding prompts for the implementer and reviewer agents,
   so setting up the loop is a one-line prompt per agent.
 
+### Fixed
+
+- `spriff supervise --install -- codex exec` / `claude -p` now resolves the agent
+  binary through the operator's current `PATH` before writing the launchd/systemd
+  service, and carries `HOME` + `PATH` into the service environment. macOS launchd
+  starts jobs with a sparse PATH, so the previous generated plist could load
+  `spriff serve` successfully but then fail every peer turn with `codex: No such
+  file or directory`.
+
 ### Notes
 
 - Stall and proactive-review nudges are written to dedicated, **non-acked**

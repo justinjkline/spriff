@@ -2149,10 +2149,72 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn resolve_program_with_path(program: &str, path_env: Option<&std::ffi::OsStr>) -> String {
+    let path = std::path::Path::new(program);
+    if path.is_absolute() || program.contains(std::path::MAIN_SEPARATOR) {
+        return program.to_string();
+    }
+    let Some(path_env) = path_env else {
+        return program.to_string();
+    };
+    for dir in std::env::split_paths(path_env) {
+        let candidate = dir.join(program);
+        if is_executable_file(&candidate) {
+            return candidate.display().to_string();
+        }
+    }
+    program.to_string()
+}
+
+fn resolve_program_for_supervisor(program: &str) -> String {
+    resolve_program_with_path(program, std::env::var_os("PATH").as_deref())
+}
+
+fn supervisor_env_from<F>(mut lookup: F) -> Vec<(String, String)>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    // Launch services run with a sparse environment (macOS launchd's default PATH
+    // is `/usr/bin:/bin:/usr/sbin:/sbin` and may omit HOME). Preserve only the
+    // non-secret process-level basics that make the re-invoked agent behave like
+    // the command the operator tested interactively; do not dump the full env.
+    ["SPRIFF_HOME", "HOME", "PATH"]
+        .into_iter()
+        .filter_map(|key| {
+            lookup(key)
+                .filter(|value| !value.is_empty())
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
+}
+
+fn supervisor_env() -> Vec<(String, String)> {
+    supervisor_env_from(|key| std::env::var(key).ok())
+}
+
 /// Render a launchd plist that runs `spriff` with `argv` under OS supervision.
 /// `RunAtLoad` + `KeepAlive` is what makes it TRULY ironclad: launchd starts it on
-/// login and respawns it if it ever exits. `env` is propagated so a custom
-/// `SPRIFF_HOME` still resolves the right board under the service. PURE + testable.
+/// login and respawns it if it ever exits. `env` carries the minimal runtime
+/// basics (`SPRIFF_HOME`/`HOME`/`PATH`) so the supervised agent resolves the same
+/// board, config, and tools the operator tested interactively. PURE + testable.
 fn launchd_plist(
     label: &str,
     argv: &[String],
@@ -2200,8 +2262,8 @@ fn launchd_plist(
 
 /// Render a systemd --user unit running `spriff` with `argv`. `Restart=always`
 /// plus the `[Install] WantedBy=default.target` (enable + linger) is the Linux
-/// equivalent of the ironclad launchd contract. `env` is propagated so a custom
-/// `SPRIFF_HOME` still resolves the right board. PURE + testable.
+/// equivalent of the ironclad launchd contract. `env` carries the same minimal
+/// runtime basics as launchd. PURE + testable.
 fn systemd_unit(
     name: &str,
     persona: &str,
@@ -2288,19 +2350,22 @@ fn cmd_supervise(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let label = label.unwrap_or_else(|| supervise_label(name, persona));
-    let argv = serve_argv(&spriff_bin, name, persona, config.as_deref(), agent_cmd);
+    let mut resolved_agent_cmd = agent_cmd.to_vec();
+    if let Some(program) = resolved_agent_cmd.first_mut() {
+        *program = resolve_program_for_supervisor(program);
+    }
+    let argv = serve_argv(
+        &spriff_bin,
+        name,
+        persona,
+        config.as_deref(),
+        &resolved_agent_cmd,
+    );
     let log_path = Sidecars::derive(&cfg.board_path(), persona)
         .log
         .with_extension("serve.log");
     let log = log_path.display().to_string();
-    // Propagate a custom SPRIFF_HOME so the boot-time service resolves the same
-    // registry/board the operator is using now (a plain `--collab` otherwise reads
-    // the default ~/.spriff under launchd/systemd).
-    let env: Vec<(String, String)> = std::env::var("SPRIFF_HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| vec![("SPRIFF_HOME".to_string(), h)])
-        .unwrap_or_default();
+    let env = supervisor_env();
 
     println!("spriff supervise — TRULY IRONCLAD subscription for {persona} on '{name}'");
     println!("================================================================\n");
@@ -3090,6 +3155,52 @@ mod tests {
         assert_eq!(
             supervise_label("Fix Checkout Flow!", "Pamela"),
             "spriff.fix-checkout-flow.pamela"
+        );
+    }
+
+    #[test]
+    fn supervisor_resolves_bare_agent_binary_before_launchd_gets_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "spriff-supervise-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = dir.join("agent-cli");
+        std::fs::write(&agent, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&agent).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&agent, perms).unwrap();
+        }
+
+        let resolved = resolve_program_with_path("agent-cli", Some(dir.as_os_str()));
+
+        assert_eq!(resolved, agent.display().to_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn supervisor_env_keeps_only_runtime_basics() {
+        let env = supervisor_env_from(|key| match key {
+            "SPRIFF_HOME" => Some("/tmp/spriff-home".to_string()),
+            "HOME" => Some("/Users/example".to_string()),
+            "PATH" => Some("/opt/homebrew/bin:/usr/bin".to_string()),
+            _ => Some("secret".to_string()),
+        });
+
+        assert_eq!(
+            env,
+            vec![
+                ("SPRIFF_HOME".to_string(), "/tmp/spriff-home".to_string()),
+                ("HOME".to_string(), "/Users/example".to_string()),
+                ("PATH".to_string(), "/opt/homebrew/bin:/usr/bin".to_string()),
+            ]
         );
     }
 
