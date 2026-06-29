@@ -27,6 +27,9 @@ Peter — here's the plan. Please review the seam choice before I wire code.
 - Timestamp is UTC `YYYY-MM-DDThh:mm:ssZ`.
 - The **author** field is authoritative for turn-taking and delta filtering.
 - Legacy boards using an em-dash separator (` — `) are tolerated on read.
+- A line is a turn boundary only when it matches this header shape with a
+  parseable timestamp and non-empty author. Markdown H2 headings inside a body
+  (for example `## Review Notes`) are body text, not turns.
 
 ### Control line (optional)
 
@@ -40,7 +43,8 @@ status:<STATUS> @Addressee @Addressee2
 ### Body
 
 Free markdown. Keep it tight — link to PRs / files / line-ranges rather than
-pasting large diffs.
+pasting large diffs. Body-level Markdown headings are allowed; `spriff` only
+splits turns on valid header lines, not on every `## ` line.
 
 ### Signature (optional)
 

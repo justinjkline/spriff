@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starts jobs with a sparse PATH, so the previous generated plist could load
   `spriff serve` successfully but then fail every peer turn with `codex: No such
   file or directory`.
+- Board parsing now treats only valid spriff turn headers as turn boundaries.
+  Body-level Markdown H2 headings such as `## Review Notes` no longer split a
+  post into phantom turns or cause a persona to see its own body sections as
+  unread peer work.
 
 ### Notes
 

@@ -63,15 +63,30 @@ fn parse_header(line: &str) -> (String, String, String) {
     }
 }
 
-/// Return the byte offsets (into `content`) at which each `## ` header line
-/// starts. Walks line starts only, so a `## ` inside a code fence in a body is
-/// not mistaken for a header unless it begins the line (acceptable, documented).
+/// True when a line is a real spriff turn header, not just a Markdown H2 inside
+/// a turn body. The board grammar is `## <timestamp> - <author> - <subject>`;
+/// accepting every `## ` line made ordinary section headings split a post into
+/// phantom turns, which could wake peers on their own body text. Legacy em-dash
+/// headers still pass because `parse_header` normalizes them before the timestamp
+/// check.
+fn is_turn_header_line(line: &str) -> bool {
+    if !line.starts_with("## ") {
+        return false;
+    }
+    let (ts, author, _subject) = parse_header(line);
+    !author.trim().is_empty() && parse_board_ts(&ts).is_some()
+}
+
+/// Return the byte offsets (into `content`) at which each real turn header line
+/// starts. Walks line starts only, and validates the canonical header shape so a
+/// body-level Markdown `## Review Notes` (or `## #5854 - ...`) remains body text.
 fn header_offsets(content: &str) -> Vec<usize> {
     let mut offsets = Vec::new();
     let mut line_start = 0usize;
     while line_start <= content.len() {
         let rest = &content[line_start..];
-        if rest.starts_with("## ") {
+        let line = rest.split_once('\n').map_or(rest, |(line, _)| line);
+        if is_turn_header_line(line) {
             offsets.push(line_start);
         }
         match rest.find('\n') {
@@ -529,6 +544,22 @@ mod tests {
         let s = "## 2026-06-28T01:00Z - Peter - PR-2 - cross-repo - map\n\nx\n";
         let turns = parse_turns(s);
         assert_eq!(turns[0].subject, "PR-2 - cross-repo - map");
+    }
+
+    #[test]
+    fn body_markdown_h2_does_not_split_turns() {
+        let s = "## 2026-06-28T01:00Z - Peter - review packet\nstatus:ACTION-REQUIRED @Pamela\n\n\
+## #5854 - blocked finding\n\nThis is a body heading, not a spriff turn.\n\n\
+## Plain Markdown Heading\n\nStill the same body.\n\n-- Peter\n\n\
+## 2026-06-28T02:00Z - Pamela - fixed\nstatus:NEEDS-REVIEW @Peter\n\nbody two\n";
+
+        let turns = parse_turns(s);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].author, "Peter");
+        assert_eq!(turns[0].subject, "review packet");
+        assert!(turns[0].body.contains("## #5854 - blocked finding"));
+        assert!(turns[0].body.contains("## Plain Markdown Heading"));
+        assert_eq!(turns[1].author, "Pamela");
     }
 
     #[test]
