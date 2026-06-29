@@ -45,6 +45,16 @@ pub struct Sidecars {
     /// Loud, human-and-agent-facing escalation with the captured content inline
     /// plus the exact ack command. Optional / for high-signal turns.
     pub action_required: PathBuf,
+    /// Inactivity-watchdog nudge: written when the whole board has gone silent
+    /// past the stall threshold. INFORMATIONAL and NON-acked — unlike the pending
+    /// signal it never touches the consume cursor, so it can't make `spriff ack`
+    /// swallow an unread peer turn. Overwritten on update, cleared when activity
+    /// resumes.
+    pub stall: PathBuf,
+    /// Proactive-review nudge: written when the implementer is actively editing
+    /// watched source before a formal handoff. Same NON-acked, informational
+    /// contract as `stall`.
+    pub review_nudge: PathBuf,
     /// Per-persona durable watch state (last-seen byte offset, last header).
     pub state: PathBuf,
     /// Append-only audit trail of every signal raised.
@@ -87,6 +97,8 @@ impl Sidecars {
             flag: join("pending.flag"),
             pending: join("pending.md"),
             action_required: join("ACTION_REQUIRED.md"),
+            stall: join("STALL.md"),
+            review_nudge: join("REVIEW_NUDGE.md"),
             state: join("watch.state"),
             ack_log: join("ack.log"),
             log: join("watch.log"),

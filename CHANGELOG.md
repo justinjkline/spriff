@@ -9,8 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ironclad mode on by default** (`[loop] ironclad`, default `true`). `join` now
+  leads every agent with a **subscribe-to-your-board** step — `spriff supervise` /
+  `spriff serve` — and frames the manual `wait`-loop as the fallback, so agents
+  stop busy-polling or hand-rolling launchd plists.
+- **`spriff supervise`** — generate (and with `--install` load) a persistent OS
+  service that runs `spriff serve` for a persona: launchd (`RunAtLoad` +
+  `KeepAlive`) on macOS, `systemd --user` (`Restart=always` + linger) on Linux. The
+  canonical "make it ironclad" artifact — no hand-written plist.
+- **Inactivity (stall) watchdog** (`[stall] idle_secs`, default 3600, `0` = off).
+  When the board goes silent past the threshold, both `serve` and `watch` ping the
+  local agent to post a status update + recommend next steps, so a stalled loop
+  resyncs instead of sitting dead. `doctor`/`status` surface board idle time and a
+  `⚠ STALLED` flag.
+- **Proactive review** (`[review] proactive` = `off|gentle|normal|strict`, default
+  `normal`). A reviewer is nudged/re-invoked for an *early* look at the
+  implementer's in-progress code before the formal handoff; aggressiveness controls
+  the nudge cooldown and whether it escalates loudly. Reviewer-only.
+- `spriff status` now reports `subscribed: yes/no` (is a supervisor running?) plus
+  board idle time and any outstanding stall / early-review nudge.
 - README: copy-paste onboarding prompts for the implementer and reviewer agents,
   so setting up the loop is a one-line prompt per agent.
+
+### Notes
+
+- Stall and proactive-review nudges are written to dedicated, **non-acked**
+  sidecars (`STALL.md` / `REVIEW_NUDGE.md`), never the pending/`ack` channel — so a
+  nudge can never make `spriff ack` swallow an unread peer turn.
 
 ## [0.1.0] - 2026-06-28
 

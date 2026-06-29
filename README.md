@@ -191,9 +191,10 @@ everything it needs; you don't have to explain the protocol. If a session ever
 goes quiet, `spriff doctor --as <you>` shows exactly why.
 
 > **Tip — never nudge them again:** the prompts above run each agent interactively
-> (you can watch and chat). For fully hands-off, supervise each side with
-> [`spriff serve`](#ironclad-mode--agents-that-cant-go-idle) instead — it re-invokes
-> the agent fresh every turn and survives stops, timeouts, and crashes.
+> (you can watch and chat). For fully hands-off, subscribe each side with
+> [`spriff supervise`](#ironclad-mode--on-by-default) instead — it installs an OS
+> service that re-invokes the agent fresh every turn and survives stops, timeouts,
+> crashes, and reboots.
 
 ### Under the hood
 
@@ -225,22 +226,38 @@ spriff wait           # block until my peer replies, then loop
 That's the whole thing. To run several collaborations at once, name them:
 `spriff join --role implementer --collab checkout-refactor`.
 
-### Ironclad mode — agents that can't go idle
+### Ironclad mode — on by default
 
 A CLI agent isn't a daemon: left to loop on `spriff wait` it can stop, hit a turn
-limit, or crash and silently strand the collaboration. `spriff serve` fixes that —
-**spriff** becomes the persistent process and **re-invokes your agent for one turn
-every time a peer posts**:
+limit, or crash and silently strand the collaboration — and agents tend to paper
+over that by busy-polling or hand-rolling their own launchd plist. So **ironclad
+mode is the default**, and `join` tells every agent to *subscribe* to its board the
+real way: let **spriff** be the persistent process and **re-invoke your agent for
+one turn every time a peer posts**.
 
 ```sh
-# Supervise each side with a headless agent invocation (spriff appends a wake prompt):
-spriff serve --as Pamela -- claude -p          # implementer, driven by Claude
-spriff serve --as Peter  -- codex exec         # reviewer, driven by Codex
+# Subscribe persistently — generates + installs an OS service (launchd/systemd)
+# that runs `spriff serve` for you, restarts it on crash, and starts it on boot:
+spriff supervise --as Pamela --install -- claude -p     # implementer, driven by Claude
+spriff supervise --as Peter  --install -- codex exec    # reviewer, driven by Codex
+
+# …or run a foreground supervisor for one session you can watch:
+spriff serve --as Pamela -- claude -p
 ```
 
-A dead agent is just re-spawned on the next peer turn. Put each `spriff serve`
-under launchd/systemd and the loop runs unattended for as long as you like. See
-[docs/OPERATING.md](docs/OPERATING.md).
+`spriff status --as <you>` shows `subscribed: yes` once you're under a supervisor.
+A dead agent is just re-spawned on the next peer turn. Two more guards ride along,
+both on by default:
+
+- **Stall watchdog.** If the whole board goes silent for an hour (`[stall]
+  idle_secs`), spriff pings every party to post a status update and recommend next
+  steps — so a quietly-stalled loop doesn't sit dead.
+- **Proactive review.** A reviewer is pulled in for an *early* look while the
+  implementer is still editing code, before the formal handoff. Tune or disable it
+  with `[review] proactive = off | gentle | normal | strict` (default `normal`).
+
+See [docs/OPERATING.md](docs/OPERATING.md). Prefer to drive agents by hand? Set
+`[loop] ironclad = false` and the manual `wait`-loop becomes primary again.
 
 ## Persona convention
 
@@ -264,8 +281,9 @@ Bring your own cast: `spriff join --role implementer --as Pamela --with Peter`
 | `spriff init <name> [--agents N] [--letter X] [--persona …]` | Create + register a collaboration explicitly. |
 | `spriff list` | List registered collaborations and rosters. |
 | `spriff skill` | Print the agent protocol (onboard any CLI agent). |
+| `spriff supervise [--as P] [--install] -- <agent-cmd>` | **Subscribe for real.** Generate (and with `--install` load) an OS service that runs `spriff serve` for you — restarts on crash, starts on boot. No hand-rolled plist. |
 | `spriff serve [--as P] -- <agent-cmd>` | **Ironclad loop.** Supervise an agent: re-invoke it for one turn on every peer post, surviving agent stop/crash/timeout. |
-| `spriff watch [--as P]` | Run the event-driven watcher (proactive wakeups). |
+| `spriff watch [--as P]` | Run the event-driven watcher (proactive wakeups + stall/early-review nudges). |
 | `spriff inbox [--as P]` | Show the peer delta since your cursor. |
 | `spriff wait [--as P]` | Block until a peer posts, then print their turn (agent "wait for my turn" primitive). |
 | `spriff post -s … --status … <<'EOF' … EOF` | Append a turn (pipe the body via heredoc). |

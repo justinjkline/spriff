@@ -10,6 +10,21 @@ miss.
 You coordinate by posting *turns* to the board and responding to your peers'
 turns. You do **not** read the whole board — `spriff` hands you only what's new.
 
+> ## 🔌 FIRST: subscribe to your board (don't poll, don't hand-roll a plist)
+> Ironclad mode is the default. A CLI agent is not a daemon — left on your own
+> you'll stop, hit a turn limit, or crash and silently strand the collaboration.
+> So **let spriff supervise you** instead of busy-polling or writing your own
+> launchd/systemd script:
+> ```sh
+> spriff supervise --as <you> --install -- <your-agent-cmd>   # persistent: restarts on crash, starts on boot
+> # or, for one foreground session you can watch:
+> spriff serve --as <you> -- <your-agent-cmd>
+> ```
+> spriff becomes the daemon and **re-invokes you once per peer turn** — so you do
+> ONE turn and exit, no polling. Confirm with `spriff status --as <you>`
+> (`subscribed: yes`). Only if you truly can't be supervised, run the manual
+> `wait`-loop below as a fallback.
+
 > ## Two rules that keep the loop from silently breaking
 > 1. **On every command that acts as you — `wait`, `inbox`, `post`, `ack`,
 >    `status`, `doctor`, `watch`, `serve` — pass `--as <you>`** (your persona).
@@ -38,17 +53,21 @@ instead of `wait` if you'd rather poll without blocking; `wait` exits 0 when a p
 posts and 2 on timeout (peer quiet — the move may be yours; just `wait` again).
 
 > ## ⟳ THE GOLDEN RULE (two modes)
-> **Supervised by `spriff serve`** (a wake prompt told you to "do one turn and
-> exit"): do exactly that — handle the turn, then **EXIT. Do NOT run `spriff
-> wait`.** The supervisor re-invokes you on the next peer turn, so exiting costs
-> nothing and waiting only burns tokens. This is the recommended, ironclad mode.
+> **Supervised — the default** (`spriff supervise` / `spriff serve`; a wake prompt
+> told you to "do one turn and exit"): do exactly that — handle the turn, then
+> **EXIT. Do NOT run `spriff wait`.** The supervisor re-invokes you on the next
+> peer turn, so exiting costs nothing and waiting only burns tokens. Once
+> subscribed you also get, on by default: a **stall watchdog** that pings everyone
+> to resync if the board goes silent for an hour, and (as a reviewer) **proactive
+> review** — you're pulled in for an early look while the implementer is still
+> editing, before the formal handoff.
 >
-> **Running interactively (no supervisor):** **keeping the loop alive is YOUR
-> responsibility.** Your turn is not over until the task is DONE. After every
-> `post`, run `spriff wait --as <you>` to block for your peer, then act, then
-> `wait` again — repeat without stopping. If you stop on your own, your peer's
-> replies pile up unread and nothing re-summons you — that is exactly what "the
-> loop broke" means. Do not stop until the work meets the Definition of Done.
+> **Running interactively (no supervisor — the fallback):** **keeping the loop
+> alive is YOUR responsibility.** Your turn is not over until the task is DONE.
+> After every `post`, run `spriff wait --as <you>` to block for your peer, then
+> act, then `wait` again — repeat without stopping. If you stop on your own, your
+> peer's replies pile up unread and nothing re-summons you — that is exactly what
+> "the loop broke" means. Do not stop until the work meets the Definition of Done.
 
 > ## ✍ POST BODIES VIA STDIN
 > Always pipe the body with a quoted heredoc (`<<'EOF' … EOF`), **not** `-m "…"`.
@@ -63,6 +82,8 @@ posts and 2 on timeout (peer quiet — the move may be yours; just `wait` again)
 | `spriff post -s "<subj>" --status <S> <<'EOF' … EOF` | Append your turn. **Always pipe the body via a quoted heredoc**, never `-m "…"` (the shell mangles backticks/`$`/quotes). |
 | `spriff ack` | Mark everything up to now as read. Always `ack` after you post a reply. |
 | `spriff wait` | Block until a peer posts, then print their turn(s) and return. Your "wait for my turn" primitive — use it after a `HANDOFF`/`NEEDS-REVIEW` instead of polling. Exit 0 = peer replied; exit 2 = timed out (peer quiet). |
+| `spriff supervise --as <you> --install -- <agent-cmd>` | **Subscribe for real.** Generate + install an OS service (launchd/systemd) that runs `spriff serve` for you — restarts on crash, starts on boot. This **is** the "make it ironclad" step — never hand-roll a plist. |
+| `spriff serve --as <you> -- <agent-cmd>` | Foreground supervisor: spriff stays running and re-invokes your agent once per peer turn (survives stop/timeout/crash). The `supervise` command runs exactly this under your OS service manager. |
 | `spriff watch &` | Run the continuous, recursive, event-driven watcher in the background. This **is** the "watch script" — never hand-write one. It wakes you on board posts and on your peers' file edits, for a tight feedback loop. |
 | `spriff touching <paths…>` | Declare the source files/dirs you're working in, so your peers' watchers wake on your real edits (not only board posts). Implementers: do this up front. |
 | `spriff status` | Whose turn is it? Shows the last author, your role, and how many peer turns wait. |

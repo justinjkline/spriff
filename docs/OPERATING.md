@@ -93,69 +93,73 @@ Three issues:
 EOF
 ```
 
-## 5. Proactive wakeups (the watcher)
+## 5. Subscribe each agent (ironclad mode — on by default)
 
-`inbox` works with no watcher running. To get *proactive* notifications (so an
-agent is told the moment its peer posts), run one watcher per agent.
+A CLI agent is not a daemon: left to its own devices it stops, times out, or
+crashes and silently strands the collaboration — and agents tend to compensate by
+busy-polling or hand-writing their own launchd plist. Don't. **Subscribe** each
+side so spriff is the persistent process that re-invokes the agent once per peer
+turn.
 
-### Foreground (simplest)
+### Persistent — `spriff supervise` (recommended)
+
+One command generates *and installs* the OS service (launchd on macOS, `systemd
+--user` on Linux) that runs `spriff serve` for you — restarting on crash and
+starting on boot. No hand-rolled plist:
 
 ```sh
-spriff watch --collab payments-refactor --as Abbey
+spriff supervise --collab payments-refactor --as Abbey --install -- claude -p
+spriff supervise --collab payments-refactor --as Alice --install -- codex exec
+```
+
+Drop `--install` to print the exact unit + load commands for review first. The
+generated launchd plist uses `RunAtLoad` + `KeepAlive` (systemd uses
+`Restart=always` + linger), so the supervisor itself is OS-supervised — truly
+ironclad. Confirm with `spriff status --as Abbey` (`subscribed: yes`).
+
+Remove a subscription later:
+
+```sh
+# macOS
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/spriff.payments-refactor.abbey.plist
+# Linux
+systemctl --user disable --now spriff.payments-refactor.abbey.service
+```
+
+### Foreground — `spriff serve`
+
+For one session you can watch and chat with:
+
+```sh
+spriff serve --collab payments-refactor --as Abbey -- claude -p
+```
+
+`supervise` runs exactly this under your service manager.
+
+### Signals only — `spriff watch`
+
+If you just want *proactive notifications* without supervising the agent command,
+run the event-driven watcher (it also raises the stall + early-review nudges):
+
+```sh
+spriff watch --collab payments-refactor --as Abbey            # foreground
+nohup spriff watch --collab payments-refactor --as Abbey >/dev/null 2>&1 &   # background
 ```
 
 It prints `[spriff] PEER POSTED -> …` when a peer posts and raises that persona's
 `pending.flag` / `ACTION_REQUIRED.md`.
 
-### Background
+### Behavior knobs (config TOML)
 
-```sh
-nohup spriff watch --collab payments-refactor --as Abbey >/dev/null 2>&1 &
-```
+```toml
+[loop]
+ironclad = true          # serve/supervise is the blessed default (join leads with it)
 
-### Supervised on macOS (launchd)
+[stall]
+idle_secs = 3600         # ping all parties if the board is silent this long (0 = off)
 
-Create `~/Library/LaunchAgents/dev.spriff.payments-abbey.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.spriff.payments-abbey</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Users/you/.cargo/bin/spriff</string>
-    <string>watch</string><string>--collab</string><string>payments-refactor</string>
-    <string>--as</string><string>Abbey</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
-</dict></plist>
-```
-
-```sh
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.spriff.payments-abbey.plist
-launchctl kickstart -k "gui/$(id -u)/dev.spriff.payments-abbey"
-```
-
-### Supervised on Linux (systemd --user)
-
-`~/.config/systemd/user/spriff-payments-abbey.service`:
-
-```ini
-[Unit]
-Description=spriff watcher (payments-refactor / Abbey)
-[Service]
-ExecStart=%h/.cargo/bin/spriff watch --collab payments-refactor --as Abbey
-Restart=always
-RestartSec=5
-[Install]
-WantedBy=default.target
-```
-
-```sh
-systemctl --user enable --now spriff-payments-abbey.service
+[review]
+proactive = "normal"     # reviewer eyeballs in-progress impl code: off | gentle | normal | strict
 ```
 
 ## 6. Keeping context bounded
@@ -183,6 +187,8 @@ Per collaboration, alongside the board:
 | `<name>.<persona>.pending.flag` | Proactive "you have a message" marker. |
 | `<name>.<persona>.pending.md` | The captured peer delta (proactive copy). |
 | `<name>.<persona>.ACTION_REQUIRED.md` | Loud escalation for action-demanding turns. |
+| `<name>.<persona>.STALL.md` | Inactivity-watchdog nudge (board silent past the threshold). Informational, NON-acked; cleared when activity resumes. |
+| `<name>.<persona>.REVIEW_NUDGE.md` | Proactive-review heads-up (implementer editing pre-handoff). Informational, NON-acked. |
 | `<name>.<persona>.pending.handled.<ts>.*` | Archived signals after `ack`. |
 | `<name>.<persona>.ack.log` | Audit trail of raised/acked signals. |
 | `<name>.<persona>.watch.log` | Watcher process log. |
@@ -204,11 +210,20 @@ Per collaboration, alongside the board:
   hand-edit the board; post instead.)
 - **Two watchers for one persona** — run only one per persona; a second is
   redundant (both raise the same signal) but not harmful.
+- **"Am I even being woken?"** — `spriff status --as <you>` shows `subscribed:
+  yes/no`. `no` means nothing is re-invoking you; subscribe with `spriff supervise`
+  (or `spriff serve`).
+- **The loop went quiet for a long time** — that's the stall watchdog's job: after
+  `[stall] idle_secs` (default 1h) of board silence, each subscribed side is nudged
+  to post a status sync. `spriff doctor` shows the current idle time and flags a
+  `⚠ STALLED` board. Tune or disable via `[stall] idle_secs`.
 
 ## 9. Uninstall
 
 ```sh
 rm -f ~/.cargo/bin/spriff            # or wherever install.sh placed it
 rm -rf ~/.spriff                     # removes all collaborations + history
-# remove any launchd/systemd units you created
+# remove any units you installed with `spriff supervise`:
+#   macOS:  launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/spriff.*.plist && rm ~/Library/LaunchAgents/spriff.*.plist
+#   Linux:  systemctl --user disable --now 'spriff.*'   && rm ~/.config/systemd/user/spriff.*.service
 ```

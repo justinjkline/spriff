@@ -660,3 +660,103 @@ fn reviewer_may_rename_the_implementer_via_with() {
     assert_eq!(cfg.matches("persona = \"Abbey\"").count(), 1, "{cfg}");
     assert_eq!(cfg.matches("persona = \"Annie\"").count(), 1, "{cfg}");
 }
+
+// ---------------------------------------------------------------------------
+// Inactivity watchdog: a board silent past the stall threshold is surfaced
+// loudly by `doctor` (idle time + a ⚠ STALLED flag), and the ironclad/proactive
+// posture is reported. Drives the real binary against a board with an old turn.
+// ---------------------------------------------------------------------------
+#[test]
+fn doctor_surfaces_a_stalled_board_and_ironclad_posture() {
+    let sb = Sandbox::new("stall");
+    let cwd = sb.cwd("op");
+    let o = sb.run(
+        &cwd,
+        &["init", "stalltest", "--agents", "2", "--letter", "a"],
+    );
+    assert!(o.status.success(), "init failed: {}", stderr(&o));
+
+    // Rewrite the board so its only turn is years old -> way past the 1h default.
+    let board = sb.root.join("stalltest").join("stalltest.board.md");
+    std::fs::write(
+        &board,
+        "# board\n\nintro\n\n## 2020-01-01T00:00:00Z - Abbey - old turn\nstatus:FYI @Alice\n\nstale\n\n-- Abbey\n",
+    )
+    .unwrap();
+
+    let d = sb.run(&cwd, &["doctor", "--collab", "stalltest"]);
+    assert!(d.status.success(), "doctor failed: {}", stderr(&d));
+    let out = stdout(&d);
+    assert!(
+        out.contains("idle:"),
+        "doctor should report idle time:\n{out}"
+    );
+    assert!(
+        out.contains("STALLED"),
+        "doctor should flag the stall:\n{out}"
+    );
+    // Ironclad on by default; proactive review at normal.
+    assert!(
+        out.contains("ironclad:"),
+        "doctor should report ironclad:\n{out}"
+    );
+    assert!(
+        out.contains("proactive-review: normal"),
+        "doctor should report proactive-review level:\n{out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `spriff supervise` emits a canonical persistent supervisor unit wrapping
+// `serve` for this persona (so nobody hand-rolls a plist), without installing
+// when --install is absent. Platform-agnostic assertions cover both launchd and
+// systemd output.
+// ---------------------------------------------------------------------------
+#[test]
+fn supervise_prints_a_serve_wrapping_unit_without_installing() {
+    let sb = Sandbox::new("sup");
+    let cwd = sb.cwd("op");
+    let o = sb.run(&cwd, &["init", "suptest", "--agents", "2", "--letter", "a"]);
+    assert!(o.status.success(), "init failed: {}", stderr(&o));
+
+    let s = sb.run(
+        &cwd,
+        &[
+            "supervise",
+            "--collab",
+            "suptest",
+            "--as",
+            "Abbey",
+            "--",
+            "echo",
+            "hi",
+        ],
+    );
+    assert!(s.status.success(), "supervise failed: {}", stderr(&s));
+    let out = stdout(&s);
+    // The generated service wraps `spriff serve` for this persona+collab.
+    assert!(out.contains("serve"), "should wrap serve:\n{out}");
+    assert!(out.contains("Abbey"), "should name the persona:\n{out}");
+    assert!(out.contains("suptest"), "should name the collab:\n{out}");
+    // Without --install it must NOT claim to have loaded/enabled anything.
+    assert!(
+        !out.contains("now subscribed"),
+        "must not install without --install:\n{out}"
+    );
+
+    // An off-roster persona is refused (same guard as serve).
+    let bad = sb.run(
+        &cwd,
+        &[
+            "supervise",
+            "--collab",
+            "suptest",
+            "--as",
+            "Zelda",
+            "--",
+            "echo",
+            "hi",
+        ],
+    );
+    assert!(!bad.status.success(), "off-roster supervise should fail");
+}

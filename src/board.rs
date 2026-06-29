@@ -17,6 +17,7 @@
 //! cost depends on board size — a 500 KB board reads as cheaply as a 5 KB one.
 
 use anyhow::{Context, Result};
+use chrono::{NaiveDateTime, TimeZone, Utc};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -160,6 +161,48 @@ pub fn last_turn_header(path: &Path) -> Option<(String, String, String)> {
     turns
         .last()
         .map(|t| (t.ts.clone(), t.author.clone(), t.subject.clone()))
+}
+
+/// Parse a board header timestamp into UTC. Tolerates the canonical
+/// second-precision form written by `utc_now()` (`2026-06-28T03:10:42Z`) AND the
+/// legacy minute-precision form seen on boards migrated from the original scripts
+/// (`2026-06-28T03:10Z`). Returns `None` for anything unparseable, so a garbled
+/// header degrades the inactivity watchdog to its mtime fallback rather than
+/// firing on a bogus elapsed time. PURE + testable.
+pub fn parse_board_ts(ts: &str) -> Option<chrono::DateTime<Utc>> {
+    let t = ts.trim();
+    // Second precision (RFC3339) — the form spriff writes.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    // Minute precision (legacy boards): no seconds field.
+    if let Ok(naive) = NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%MZ") {
+        return Some(Utc.from_utc_datetime(&naive));
+    }
+    None
+}
+
+/// Seconds since the most recent activity on the board, for the inactivity
+/// watchdog. Prefers the last turn's declared timestamp (restart-safe and exact);
+/// falls back to the board file's mtime when there are no turns yet (the
+/// implementer never made the opening move) or the timestamp won't parse. Returns
+/// `None` only if the board doesn't exist. Never negative — clock skew clamps to 0.
+pub fn seconds_since_last_activity(path: &Path) -> Option<i64> {
+    if !path.exists() {
+        return None;
+    }
+    if let Some((ts, _, _)) = last_turn_header(path) {
+        if let Some(dt) = parse_board_ts(&ts) {
+            return Some((Utc::now() - dt).num_seconds().max(0));
+        }
+    }
+    // Fallback: how long since the file itself was last written.
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()?
+        .as_secs();
+    Some(elapsed as i64)
 }
 
 /// The closed status vocabulary (see docs/BOARD-GRAMMAR.md). Kept here, next to
@@ -422,6 +465,44 @@ mod tests {
         assert_eq!(turns[0].subject, "hello");
         assert_eq!(turns[1].author, "Pamela");
         assert!(turns[1].body.contains("body two"));
+    }
+
+    #[test]
+    fn parse_board_ts_handles_both_precisions() {
+        // Second precision (what spriff writes) and legacy minute precision.
+        assert!(parse_board_ts("2026-06-28T03:10:42Z").is_some());
+        assert!(parse_board_ts("2026-06-28T03:10Z").is_some());
+        // The two forms at the same minute agree to the second.
+        let a = parse_board_ts("2026-06-28T03:10:00Z").unwrap();
+        let b = parse_board_ts("2026-06-28T03:10Z").unwrap();
+        assert_eq!(a, b);
+        // Garbage -> None, so the watchdog falls back to mtime instead of firing
+        // on a bogus elapsed time.
+        assert!(parse_board_ts("not-a-timestamp").is_none());
+        assert!(parse_board_ts("").is_none());
+    }
+
+    #[test]
+    fn idle_seconds_uses_last_turn_timestamp() {
+        let dir = std::env::temp_dir().join(format!("spriff-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let board = dir.join("idle.board.md");
+        // A turn far in the past -> a large, positive idle reading.
+        append_turn(
+            &board,
+            "2020-01-01T00:00:00Z",
+            "Peter",
+            "old",
+            "FYI",
+            &[],
+            "x",
+        )
+        .unwrap();
+        let idle = seconds_since_last_activity(&board).unwrap();
+        assert!(idle > 60 * 60, "expected a multi-year idle, got {idle}s");
+        // A missing board is unknown, not stalled.
+        assert!(seconds_since_last_activity(&dir.join("nope.md")).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

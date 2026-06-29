@@ -20,6 +20,7 @@
 
 use crate::board;
 use crate::config::Config;
+use crate::nudge;
 use crate::paths::Sidecars;
 use crate::pending;
 use crate::state::WatchState;
@@ -95,6 +96,20 @@ pub fn run(cfg: &Config, persona: &str) -> Result<()> {
     // Coalesce the low-key workspace-changed notice so a burst of saves is one line.
     let mut last_workspace_notice = Instant::now() - Duration::from_secs(3600);
 
+    // Ironclad extras (config-driven, on by default):
+    //   * the inactivity watchdog — ping the agent when the whole board goes silent;
+    //   * proactive review — a reviewer eyeballs the implementer's in-progress code.
+    // Both raise their own NON-acked nudge artifacts (see nudge.rs), so neither can
+    // make `spriff ack` swallow an unread peer turn.
+    let stall_idle = cfg.stall_idle_secs();
+    let aggr = cfg.review_aggressiveness();
+    let is_reviewer = cfg.is_reviewer(persona);
+    let review_cooldown = Duration::from_secs(aggr.cooldown_secs());
+    // `Option<Instant>` (None = armed) instead of `now - dur` arithmetic, which can
+    // underflow right after startup. Tracks the last time each nudge fired.
+    let mut last_stall: Option<Instant> = None;
+    let mut last_review: Option<Instant> = None;
+
     loop {
         // Block until a real FS event OR the safety-poll timeout. Either way we
         // proceed to (settle, then) process — the timeout is the periodic safety
@@ -149,18 +164,86 @@ pub fn run(cfg: &Config, persona: &str) -> Result<()> {
             }
         };
 
-        // Workspace-changed: a LOW-KEY, non-escalating notice that a peer edited a
-        // watched file (not a board post). The board stays the only actionable
-        // handoff signal; this just keeps the promise that `watch` reports edits.
+        // A peer edited a watched file (not a board post). For a REVIEWER with
+        // proactive review on, this is the signal to take an EARLY look at the
+        // implementer's in-progress code — raise a review nudge (loud at `strict`).
+        // For everyone else (or proactive off) it stays the prior LOW-KEY notice:
+        // the board remains the only actionable handoff signal. Suppressed while a
+        // real pending is up, so a heads-up never buries a formal review request.
         if !raised {
             if let Some(path) = workspace_hit {
-                if last_workspace_notice.elapsed() >= Duration::from_secs(2) {
+                let proactive = is_reviewer
+                    && !aggr.is_off()
+                    && !pending::is_raised(&sc)
+                    && last_review
+                        .map(|t| t.elapsed() >= review_cooldown)
+                        .unwrap_or(true);
+                if proactive {
+                    match nudge::raise_review(
+                        &sc,
+                        persona,
+                        std::slice::from_ref(&path),
+                        aggr.escalates(),
+                    ) {
+                        Ok(()) => {
+                            let msg = format!(
+                                "proactive-review nudge ({}) — implementer editing {}",
+                                aggr.as_str(),
+                                path.display()
+                            );
+                            log(&sc.log, &msg);
+                            eprintln!("[spriff] reviewer heads-up: {msg}");
+                            last_review = Some(Instant::now());
+                        }
+                        Err(e) => log(&sc.log, &format!("review nudge failed: {e}")),
+                    }
+                } else if last_workspace_notice.elapsed() >= Duration::from_secs(2) {
                     let msg = format!("peer workspace changed: {}", path.display());
                     log(&sc.log, &msg);
                     eprintln!("[spriff] {msg} (no board post yet)");
                     last_workspace_notice = Instant::now();
                 }
             }
+        }
+
+        // Inactivity watchdog: the WHOLE board (not just our inbox) has gone quiet.
+        // Distinct from the pending signal — that fires when a peer DID post and we
+        // owe a turn; this fires when NOBODY is posting and the loop is stalling.
+        // So gate it on an empty inbox (no `raised` this pass, no outstanding
+        // pending) and re-fire at most once per `stall_idle` window.
+        if stall_idle > 0 {
+            let idle = board::seconds_since_last_activity(&board_path).unwrap_or(0);
+            let inbox_clear = !raised && !pending::is_raised(&sc);
+            let armed = last_stall
+                .map(|t| t.elapsed() >= Duration::from_secs(stall_idle))
+                .unwrap_or(true);
+            if idle as u64 >= stall_idle && inbox_clear && armed {
+                match nudge::raise_stall(&sc, persona, idle) {
+                    Ok(()) => {
+                        log(
+                            &sc.log,
+                            &format!("STALL: board idle {idle}s (>= {stall_idle}s) — raised nudge"),
+                        );
+                        eprintln!(
+                            "[spriff] ⚠ STALL: board silent ~{}m — wrote {} (post a status sync)",
+                            idle / 60,
+                            sc.stall.display()
+                        );
+                        last_stall = Some(Instant::now());
+                    }
+                    Err(e) => log(&sc.log, &format!("stall nudge failed: {e}")),
+                }
+            } else if (idle as u64) < stall_idle {
+                // Activity resumed — drop a stale stall nudge and re-arm.
+                nudge::clear_stall(&sc);
+                last_stall = None;
+            }
+        }
+
+        // A real board post means a handoff happened: any early-look heads-up is now
+        // moot, so clear it (the formal review supersedes it).
+        if raised {
+            nudge::clear_review(&sc);
         }
     }
 

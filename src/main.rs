@@ -8,6 +8,7 @@
 mod board;
 mod config;
 mod names;
+mod nudge;
 mod paths;
 mod pending;
 mod registry;
@@ -18,7 +19,7 @@ mod watcher;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
-use paths::Sidecars;
+use paths::{expand_tilde, Sidecars};
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -183,6 +184,32 @@ enum Cmd {
         no_kickoff: bool,
         /// The agent command to run per turn (everything after `--`). spriff
         /// appends a wake prompt as the final argument. e.g. `-- claude -p`.
+        #[arg(last = true, required = true)]
+        agent_cmd: Vec<String>,
+    },
+
+    /// SUBSCRIBE for real: generate (and optionally install) an OS service that
+    /// runs `spriff serve` for you — restarting it on crash and starting it on
+    /// boot. This is the TRULY IRONCLAD way to subscribe to your board: no
+    /// busy-polling, no hand-rolled launchd plist. Prints the unit + the exact
+    /// install/remove commands; `--install` writes and loads it for you.
+    /// Example: `spriff supervise --as Alice --install -- codex exec`.
+    Supervise {
+        #[arg(long)]
+        collab: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long = "as")]
+        as_persona: Option<String>,
+        /// Override the service label (default: `spriff.<collab>.<persona>`).
+        #[arg(long)]
+        label: Option<String>,
+        /// Write the unit to its standard location and load it now (otherwise the
+        /// unit is only printed for you to review/install yourself).
+        #[arg(long)]
+        install: bool,
+        /// The agent command to supervise (everything after `--`), exactly as for
+        /// `serve`. e.g. `-- claude -p`.
         #[arg(last = true, required = true)]
         agent_cmd: Vec<String>,
     },
@@ -397,6 +424,18 @@ fn main() -> Result<()> {
                 &agent_cmd,
                 config,
             )
+        }
+        Cmd::Supervise {
+            collab,
+            config,
+            as_persona,
+            label,
+            install,
+            agent_cmd,
+        } => {
+            let (cfg, name) = resolve(collab, config.clone())?;
+            let persona = resolve_persona(as_persona, &cfg);
+            cmd_supervise(&cfg, &name, &persona, label, install, &agent_cmd, config)
         }
         Cmd::Post {
             collab,
@@ -1338,8 +1377,57 @@ fn cmd_join(
     println!("════════════════════════════════════════════════════════════════\n");
     print!("{SKILL}");
     let me = persona.as_str();
-    println!("\n═══════════ YOUR JOB — run this loop, and NEVER stop on your own ═══════════");
-    println!("Two rules that keep the loop from silently breaking:");
+    let stall_idle = cfg.stall_idle_secs();
+    let stall_min = (stall_idle / 60).max(1);
+    if cfg.is_ironclad() {
+        println!("\n═══════════ STEP 0 — SUBSCRIBE TO YOUR BOARD (do this FIRST) ═══════════");
+        println!("IRONCLAD MODE is the default, and a CLI agent is not a daemon: left on your own");
+        println!("you'll stop, hit a turn limit, or crash and silently strand the collaboration.");
+        println!(
+            "So DON'T busy-poll, and DON'T hand-roll a launchd plist — subscribe the real way:"
+        );
+        println!();
+        println!("  ▶ PERSISTENT (best — restarts on crash, starts on boot):");
+        println!("        spriff supervise --as {me} --install -- <your-agent-cmd>");
+        println!("  ▶ FOREGROUND (one session, you can watch/chat):");
+        println!("        spriff serve --as {me} -- <your-agent-cmd>");
+        println!(
+            "    (<your-agent-cmd> is your headless agent, e.g. `claude -p` or `codex exec`.)"
+        );
+        println!();
+        println!(
+            "Either way spriff becomes the daemon and RE-INVOKES you once per peer turn, so you"
+        );
+        println!(
+            "do EXACTLY ONE turn per wake, then EXIT (no `spriff wait`, no polling). Also ON BY"
+        );
+        println!("DEFAULT once subscribed:");
+        if stall_idle > 0 {
+            println!(
+                "  • a STALL WATCHDOG pings everyone to resync if the board goes silent >{stall_min}min;"
+            );
+        }
+        if is_review && !cfg.review_aggressiveness().is_off() {
+            println!(
+                "  • PROACTIVE REVIEW pulls you in for an early look whenever the implementer is"
+            );
+            println!(
+                "    actively editing code ('{}' aggressiveness — tune via [review] proactive).",
+                cfg.review_aggressiveness().as_str()
+            );
+        } else if is_impl && !cfg.review_aggressiveness().is_off() {
+            println!(
+                "  • PROACTIVE REVIEW — your reviewer may peek at your in-progress code early, so"
+            );
+            println!("    run `spriff touching <paths>` to point them at what you're building.");
+        }
+        println!("\nConfirm you're subscribed anytime: `spriff status --as {me}` (shows \"subscribed: yes\").");
+        println!("Only if you truly can't be supervised, run the manual loop below as a FALLBACK.");
+        println!("\n═══════════ YOUR JOB — one turn each time you're woken ═══════════");
+    } else {
+        println!("\n═══════════ YOUR JOB — run this loop, and NEVER stop on your own ═══════════");
+    }
+    println!("\nTwo rules that keep the loop from silently breaking:");
     println!(
         "  • On every command that ACTS AS YOU — wait, inbox, post, ack, status, doctor, watch,"
     );
@@ -1383,10 +1471,15 @@ fn cmd_join(
         println!("     You're a different model than the implementer — your job is catching what they can't.");
     }
     println!(
-        "\n⚠ Keeping this loop running is YOUR responsibility. If you stop, your peer's posts pile"
+        "\n⚠ Running this loop UNSUPERVISED? Then keeping it alive is YOUR responsibility: if you"
     );
-    println!("  up unread and nothing re-summons you — that's what \"the loop broke\" means. Don't stop.");
-    println!("  Re-read the full protocol anytime: spriff skill");
+    println!(
+        "  stop, your peer's posts pile up unread and nothing re-summons you — that's what \"the"
+    );
+    println!(
+        "  loop broke\" means. (Under `spriff serve` the supervisor handles this — just do one"
+    );
+    println!("  turn and exit.) Re-read the full protocol anytime: spriff skill");
 
     // Live situation: whatever is already waiting, handle now, then continue looping.
     println!("\n──────────────────────────────── right now ────────────────────────────────");
@@ -1656,6 +1749,25 @@ fn cmd_serve(
         if mission.is_some() { " [drive-to-completion mission set]" } else { "" }
     );
 
+    // Ironclad extras (config-driven, on by default): the inactivity watchdog and,
+    // for a reviewer, proactive review of the implementer's in-progress code.
+    let stall_idle = cfg.stall_idle_secs();
+    let aggr = cfg.review_aggressiveness();
+    let is_reviewer = cfg.is_reviewer(persona);
+    eprintln!(
+        "[spriff] ironclad extras: stall-watchdog {}, proactive-review {}",
+        if stall_idle > 0 {
+            format!("{stall_idle}s")
+        } else {
+            "off".to_string()
+        },
+        if is_reviewer {
+            aggr.as_str().to_string()
+        } else {
+            "n/a (implementer)".to_string()
+        }
+    );
+
     // Kickoff: an opening invocation so an implementer can LEAD and a reviewer can
     // catch up on anything already waiting. Completion is judged below, not here.
     if kickoff {
@@ -1672,11 +1784,90 @@ fn cmd_serve(
     let mut idle_since = Instant::now();
     let mut current_header = String::new();
     let mut attempts: u32 = 0;
+    // `Option<Instant>` (None = armed) avoids `now - dur` underflow near startup.
+    let mut last_stall: Option<Instant> = None;
+    let mut last_review: Option<Instant> = None;
+    // Newest peer-source mtime we've already nudged for, so the same edits don't
+    // re-fire the proactive-review invocation.
+    let mut review_baseline: Option<std::time::SystemTime> = None;
 
     loop {
         let turns = current_delta(cfg, persona)?;
         let Some(latest) = turns.last() else {
-            // Nothing waiting. Stand down if idle long enough.
+            // Nothing in OUR inbox. Before standing down or sleeping, run the
+            // ironclad extras: nudge a stalled board, and (as a reviewer) take an
+            // early look at the implementer's in-progress code.
+
+            // Inactivity watchdog: the board has been silent past the threshold, so
+            // invoke THIS agent to post a status sync — which re-engages everyone
+            // (the peer's supervisor wakes on the resulting board post). Re-fires at
+            // most once per `stall_idle` window.
+            if stall_idle > 0 {
+                let idle = board::seconds_since_last_activity(&cfg.board_path()).unwrap_or(0);
+                let armed = last_stall
+                    .map(|t| t.elapsed() >= Duration::from_secs(stall_idle))
+                    .unwrap_or(true);
+                if idle as u64 >= stall_idle && armed {
+                    eprintln!(
+                        "[spriff] ⚠ STALL: board silent ~{}m — invoking {persona} for a status sync.",
+                        idle / 60
+                    );
+                    run_agent(
+                        agent_cmd,
+                        name,
+                        persona,
+                        config.as_deref(),
+                        &stall_prompt(
+                            name,
+                            persona,
+                            idle as u64,
+                            mission.as_deref(),
+                            lens.as_deref(),
+                        ),
+                    );
+                    last_stall = Some(Instant::now());
+                    idle_since = Instant::now(); // an invocation happened; don't also stand down now
+                    continue;
+                }
+            }
+
+            // Proactive review: the implementer is editing watched source AFTER the
+            // last board post (no formal handoff yet) -> pull the reviewer in for an
+            // early look. Throttled by the aggressiveness cooldown; `review_baseline`
+            // dedups so the same edits don't re-fire.
+            if is_reviewer && !aggr.is_off() {
+                let due = last_review
+                    .map(|t| t.elapsed() >= Duration::from_secs(aggr.cooldown_secs()))
+                    .unwrap_or(true);
+                if due {
+                    if let Some((files, newest)) =
+                        peer_edits_since_board(cfg, persona, review_baseline)
+                    {
+                        eprintln!(
+                            "[spriff] reviewer early-look: implementer editing {} path(s) — invoking {persona}.",
+                            files.len()
+                        );
+                        run_agent(
+                            agent_cmd,
+                            name,
+                            persona,
+                            config.as_deref(),
+                            &review_prompt(
+                                name,
+                                persona,
+                                &files,
+                                lens.as_deref(),
+                                aggr.escalates(),
+                            ),
+                        );
+                        review_baseline = Some(newest);
+                        last_review = Some(Instant::now());
+                        continue;
+                    }
+                }
+            }
+
+            // Stand down if idle long enough; else sleep and re-check.
             if idle_timeout > 0 && idle_since.elapsed().as_secs() >= idle_timeout {
                 eprintln!("[spriff] no peer turn for {idle_timeout}s — standing down.");
                 return Ok(());
@@ -1843,6 +2034,415 @@ fn kickoff_prompt(name: &str, persona: &str, mission: Option<&str>, lens: Option
     )
 }
 
+/// The supervisor's stall-sync wake prompt: the board has gone silent, so the
+/// agent is invoked to break the silence with a status update + recommended next
+/// step (the inactivity watchdog's "ping all parties to resync").
+fn stall_prompt(
+    name: &str,
+    persona: &str,
+    idle_secs: u64,
+    mission: Option<&str>,
+    lens: Option<&str>,
+) -> String {
+    let mins = idle_secs / 60;
+    format!(
+        "You are {persona}, an agent on the spriff collaboration '{name}'. The board has been \
+         SILENT for ~{mins} minutes — the collaboration has STALLED. Break the silence in ONE \
+         turn, then EXIT: run `spriff status` and `spriff inbox` to reassess, then `spriff post` \
+         a brief STATUS update to your peer(s) covering (1) where the work stands, (2) what — if \
+         anything — is blocking you, and (3) your recommended next step. If you're actually \
+         waiting on your peer, say so explicitly and @them so they re-engage. If the work already \
+         meets the bar, open the PR and post `--status DONE`. Do NOT run `spriff wait`; the \
+         supervisor re-invokes you when your peer next posts.{}{}",
+        completion_clause(mission),
+        lens_clause(lens),
+    )
+}
+
+/// The supervisor's proactive-review wake prompt: the implementer is actively
+/// editing watched source before a formal handoff, so the reviewer is pulled in
+/// for an EARLY look. `escalate` is the loud (strict-aggressiveness) variant.
+fn review_prompt(
+    name: &str,
+    persona: &str,
+    files: &[PathBuf],
+    lens: Option<&str>,
+    escalate: bool,
+) -> String {
+    let list = files
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let urgency = if escalate {
+        "You're in STRICT proactive-review mode — jump on it NOW."
+    } else {
+        "Take an early look ahead of the formal handoff."
+    };
+    format!(
+        "You are {persona}, the REVIEWER on the spriff collaboration '{name}'. Your implementer is \
+         actively changing watched source ({list}) but hasn't posted a formal handoff yet. \
+         {urgency} Do ONE turn, then EXIT: read the in-progress diff and, if you spot something \
+         worth flagging, `spriff post --status FYI` a concise early observation (file:line + the \
+         specific concern) so they can course-correct before the formal review. If nothing stands \
+         out, briefly note what you checked. This is a heads-up, NOT the formal review — don't \
+         block a handoff that hasn't happened yet. Do NOT run `spriff wait`; the supervisor \
+         re-invokes you on the next peer turn.{}",
+        lens_clause(lens),
+    )
+}
+
+/// Every source root a reviewer should watch its implementer touch: the config
+/// `watchpaths` of peers plus any paths they've declared live via `spriff
+/// touching`. Mirrors the watcher's reconcile so `serve` (which has no FS-event
+/// watcher) sees the same set.
+fn peer_source_roots(cfg: &Config, persona: &str) -> Vec<PathBuf> {
+    let mut roots = cfg.peer_watchpaths(persona);
+    let board = cfg.board_path();
+    for peer in cfg.peers(persona) {
+        let psc = Sidecars::derive(&board, &peer);
+        roots.extend(paths::read_watchpaths(&psc.watchpaths));
+    }
+    roots
+}
+
+/// Has the implementer edited watched source SINCE the last board post (i.e. is
+/// it changing code without having handed off)? Returns the existing watched
+/// roots and the newest mtime when so, else `None`. `baseline` is the newest
+/// mtime already nudged for, so unchanged source doesn't re-fire.
+fn peer_edits_since_board(
+    cfg: &Config,
+    persona: &str,
+    baseline: Option<std::time::SystemTime>,
+) -> Option<(Vec<PathBuf>, std::time::SystemTime)> {
+    let roots = peer_source_roots(cfg, persona);
+    if roots.is_empty() {
+        return None;
+    }
+    let newest = util::newest_mtime(&roots)?;
+    // The board file's mtime is a cheap proxy for "last board activity"; if source
+    // is newer, the implementer edited after the last post (no handoff yet).
+    let board_mtime = std::fs::metadata(cfg.board_path()).ok()?.modified().ok()?;
+    if newest <= board_mtime {
+        return None;
+    }
+    if let Some(b) = baseline {
+        if newest <= b {
+            return None; // nothing new since the last nudge
+        }
+    }
+    let existing: Vec<PathBuf> = roots.into_iter().filter(|p| p.exists()).collect();
+    Some((existing, newest))
+}
+
+/// A filesystem-safe service label for a collaboration + persona.
+fn supervise_label(name: &str, persona: &str) -> String {
+    format!("spriff.{}.{}", slugify(name), slugify(persona))
+}
+
+/// XML-escape a string for safe inclusion in a launchd plist `<string>`.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Render a launchd plist that runs `spriff` with `argv` under OS supervision.
+/// `RunAtLoad` + `KeepAlive` is what makes it TRULY ironclad: launchd starts it on
+/// login and respawns it if it ever exits. `env` is propagated so a custom
+/// `SPRIFF_HOME` still resolves the right board under the service. PURE + testable.
+fn launchd_plist(
+    label: &str,
+    argv: &[String],
+    workdir: &str,
+    log: &str,
+    env: &[(String, String)],
+) -> String {
+    let mut args_xml = String::new();
+    for a in argv {
+        args_xml.push_str(&format!("    <string>{}</string>\n", xml_escape(a)));
+    }
+    let env_xml = if env.is_empty() {
+        String::new()
+    } else {
+        let mut e = String::from("  <key>EnvironmentVariables</key><dict>\n");
+        for (k, v) in env {
+            e.push_str(&format!(
+                "    <key>{}</key><string>{}</string>\n",
+                xml_escape(k),
+                xml_escape(v)
+            ));
+        }
+        e.push_str("  </dict>\n");
+        e
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\"><dict>\n\
+         \x20 <key>Label</key><string>{label}</string>\n\
+         \x20 <key>ProgramArguments</key>\n  <array>\n{args_xml}  </array>\n\
+         {env_xml}\
+         \x20 <key>WorkingDirectory</key><string>{workdir}</string>\n\
+         \x20 <key>RunAtLoad</key><true/>\n\
+         \x20 <key>KeepAlive</key><true/>\n\
+         \x20 <key>ThrottleInterval</key><integer>10</integer>\n\
+         \x20 <key>StandardOutPath</key><string>{log}</string>\n\
+         \x20 <key>StandardErrorPath</key><string>{log}</string>\n\
+         </dict></plist>\n",
+        label = xml_escape(label),
+        workdir = xml_escape(workdir),
+        log = xml_escape(log),
+    )
+}
+
+/// Render a systemd --user unit running `spriff` with `argv`. `Restart=always`
+/// plus the `[Install] WantedBy=default.target` (enable + linger) is the Linux
+/// equivalent of the ironclad launchd contract. `env` is propagated so a custom
+/// `SPRIFF_HOME` still resolves the right board. PURE + testable.
+fn systemd_unit(
+    name: &str,
+    persona: &str,
+    exec: &str,
+    workdir: &str,
+    env: &[(String, String)],
+) -> String {
+    let env_lines: String = env
+        .iter()
+        .map(|(k, v)| format!("Environment={k}={v}\n"))
+        .collect();
+    format!(
+        "[Unit]\n\
+         Description=spriff supervisor ({name} / {persona})\n\
+         After=network.target\n\n\
+         [Service]\n\
+         Type=simple\n\
+         WorkingDirectory={workdir}\n\
+         {env_lines}\
+         ExecStart={exec}\n\
+         Restart=always\n\
+         RestartSec=5\n\n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
+/// Build the `serve` argv this supervisor wraps (absolute spriff binary first).
+fn serve_argv(
+    spriff_bin: &str,
+    name: &str,
+    persona: &str,
+    config: Option<&std::path::Path>,
+    agent_cmd: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
+        spriff_bin.to_string(),
+        "serve".to_string(),
+        "--collab".to_string(),
+        name.to_string(),
+        "--as".to_string(),
+        persona.to_string(),
+    ];
+    if let Some(c) = config {
+        argv.push("--config".to_string());
+        argv.push(c.display().to_string());
+    }
+    argv.push("--".to_string());
+    argv.extend(agent_cmd.iter().cloned());
+    argv
+}
+
+/// Generate (and optionally install) a persistent OS service that runs `spriff
+/// serve` for this persona — the "truly ironclad" subscription. Solves the two
+/// failure modes the design set out to kill: agents busy-polling, and agents
+/// hand-rolling their own launchd plist instead of using one canonical artifact.
+#[allow(clippy::too_many_arguments)]
+fn cmd_supervise(
+    cfg: &Config,
+    name: &str,
+    persona: &str,
+    label: Option<String>,
+    install: bool,
+    agent_cmd: &[String],
+    config: Option<PathBuf>,
+) -> Result<()> {
+    // Same identity guard as serve: never supervise an off-roster persona.
+    if !cfg
+        .agents
+        .iter()
+        .any(|a| a.persona.eq_ignore_ascii_case(persona))
+    {
+        let roster: Vec<&str> = cfg.agents.iter().map(|a| a.persona.as_str()).collect();
+        anyhow::bail!(
+            "persona '{persona}' is not on '{name}' roster [{}]. Use --as <one of them>.",
+            roster.join(", ")
+        );
+    }
+
+    let spriff_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "spriff".to_string());
+    let workdir = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let label = label.unwrap_or_else(|| supervise_label(name, persona));
+    let argv = serve_argv(&spriff_bin, name, persona, config.as_deref(), agent_cmd);
+    let log_path = Sidecars::derive(&cfg.board_path(), persona)
+        .log
+        .with_extension("serve.log");
+    let log = log_path.display().to_string();
+    // Propagate a custom SPRIFF_HOME so the boot-time service resolves the same
+    // registry/board the operator is using now (a plain `--collab` otherwise reads
+    // the default ~/.spriff under launchd/systemd).
+    let env: Vec<(String, String)> = std::env::var("SPRIFF_HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(|h| vec![("SPRIFF_HOME".to_string(), h)])
+        .unwrap_or_default();
+
+    println!("spriff supervise — TRULY IRONCLAD subscription for {persona} on '{name}'");
+    println!("================================================================\n");
+    println!("This runs `spriff serve` under your OS service manager: it restarts on crash");
+    println!("AND starts on login/boot — event-driven, no polling, no hand-rolled plist.\n");
+
+    if cfg!(target_os = "macos") {
+        let plist = launchd_plist(&label, &argv, &workdir, &log, &env);
+        let plist_path = expand_tilde(&PathBuf::from(format!(
+            "~/Library/LaunchAgents/{label}.plist"
+        )));
+        if install {
+            if let Some(parent) = plist_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(&plist_path, &plist)
+                .with_context(|| format!("writing {}", plist_path.display()))?;
+            println!("wrote {}", plist_path.display());
+            let domain = format!("gui/{}", users_uid());
+            // bootout first (ignore failure: it may not be loaded yet), then bootstrap.
+            run_quiet(
+                "launchctl",
+                &[
+                    "bootout".into(),
+                    domain.clone(),
+                    plist_path.display().to_string(),
+                ],
+            );
+            let ok = run_quiet(
+                "launchctl",
+                &[
+                    "bootstrap".into(),
+                    domain.clone(),
+                    plist_path.display().to_string(),
+                ],
+            );
+            run_quiet(
+                "launchctl",
+                &["kickstart".into(), "-k".into(), format!("{domain}/{label}")],
+            );
+            if ok {
+                println!("loaded service '{label}'. You are now subscribed — `spriff status --as {persona}` will show it.");
+            } else {
+                println!("wrote the plist but couldn't load it automatically. Load it with:");
+                println!("    launchctl bootstrap {domain} {}", plist_path.display());
+            }
+            println!("\nRemove later with:");
+            println!("    launchctl bootout {domain} {}", plist_path.display());
+            println!("    rm {}", plist_path.display());
+        } else {
+            println!("# {}\n{plist}", plist_path.display());
+            println!("Install + load it (or re-run with --install to do this for you):");
+            println!("    mkdir -p ~/Library/LaunchAgents");
+            println!("    cat > {} <<'PLIST'\n{plist}PLIST", plist_path.display());
+            println!(
+                "    launchctl bootstrap gui/$(id -u) {}",
+                plist_path.display()
+            );
+            println!("    launchctl kickstart -k gui/$(id -u)/{label}");
+        }
+    } else {
+        // systemd --user (Linux and other unixes).
+        let exec = argv
+            .iter()
+            .map(|a| {
+                if a.contains(' ') {
+                    format!("\"{a}\"")
+                } else {
+                    a.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let unit = systemd_unit(name, persona, &exec, &workdir, &env);
+        let unit_name = format!("{label}.service");
+        let unit_path = expand_tilde(&PathBuf::from(format!(
+            "~/.config/systemd/user/{unit_name}"
+        )));
+        if install {
+            if let Some(parent) = unit_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(&unit_path, &unit)
+                .with_context(|| format!("writing {}", unit_path.display()))?;
+            println!("wrote {}", unit_path.display());
+            run_quiet("systemctl", &["--user".into(), "daemon-reload".into()]);
+            let ok = run_quiet(
+                "systemctl",
+                &[
+                    "--user".into(),
+                    "enable".into(),
+                    "--now".into(),
+                    unit_name.clone(),
+                ],
+            );
+            // Survive logout/reboot even with no active session.
+            run_quiet("loginctl", &["enable-linger".into()]);
+            if ok {
+                println!("enabled service '{unit_name}'. You are now subscribed — `spriff status --as {persona}` will show it.");
+            } else {
+                println!("wrote the unit but couldn't enable it automatically. Enable it with:");
+                println!("    systemctl --user enable --now {unit_name}");
+            }
+            println!("\nRemove later with:");
+            println!("    systemctl --user disable --now {unit_name}");
+            println!("    rm {}", unit_path.display());
+        } else {
+            println!("# {}\n{unit}", unit_path.display());
+            println!("Install + enable it (or re-run with --install to do this for you):");
+            println!("    mkdir -p ~/.config/systemd/user");
+            println!("    cat > {} <<'UNIT'\n{unit}UNIT", unit_path.display());
+            println!("    systemctl --user enable --now {unit_name}");
+            println!("    loginctl enable-linger   # survive logout/reboot");
+        }
+    }
+    Ok(())
+}
+
+/// Current effective uid as a string (for the launchd `gui/<uid>` domain).
+fn users_uid() -> String {
+    // Avoid a libc dep: read it from the environment the way launchctl expects,
+    // falling back to a shell-out. `id -u` is universally present on macOS.
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "$(id -u)".to_string())
+}
+
+/// Run a command, inheriting stderr so the operator sees loader errors, and
+/// return whether it succeeded. Best-effort: a missing tool is just `false`.
+fn run_quiet(prog: &str, args: &[String]) -> bool {
+    std::process::Command::new(prog)
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
     let board_path = cfg.board_path();
     let sc = Sidecars::derive(&board_path, persona);
@@ -1886,6 +2486,38 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
         println!("  inbox:      {new} new peer turn(s) waiting — run `spriff inbox`");
     } else {
         println!("  inbox:      clear");
+    }
+    // Subscription: is this persona actually subscribed (a supervisor running)?
+    // The whole point of ironclad mode — surfaced so a quiet loop is never a
+    // mystery ("am I even being woken?").
+    let subscribed = is_serve_running(&board_path, persona);
+    println!(
+        "  subscribed: {}",
+        if subscribed {
+            "yes — serve supervisor running (event-driven; you'll be re-invoked on each peer turn)"
+        } else {
+            "NO — not under `spriff serve`. Subscribe: `spriff supervise --as <you> -- <agent-cmd>`"
+        }
+    );
+    // Inactivity watchdog.
+    let stall_idle = cfg.stall_idle_secs();
+    if stall_idle > 0 {
+        if let Some(idle) = board::seconds_since_last_activity(&board_path) {
+            if idle as u64 >= stall_idle {
+                println!(
+                    "  idle:       {idle}s — ⚠ STALLED (>= {stall_idle}s); post a status sync"
+                );
+            } else {
+                println!("  idle:       {idle}s (stall threshold {stall_idle}s)");
+            }
+        }
+    }
+    // Outstanding non-acked nudges for this persona.
+    if nudge::exists(&sc.stall) {
+        println!("  ⚠ stall nudge raised — break the silence with a status post");
+    }
+    if nudge::exists(&sc.review_nudge) {
+        println!("  review nudge — implementer is editing; take an early look");
     }
     Ok(())
 }
@@ -1983,6 +2615,36 @@ fn cmd_doctor(
                     if line.len() > 80 { "…" } else { "" }
                 );
             }
+            // Inactivity watchdog: how long the board has been silent vs the
+            // threshold. A breach is the loud "the collaboration stalled" signal.
+            let stall_idle = cfg.stall_idle_secs();
+            if stall_idle > 0 {
+                if let Some(idle) = board::seconds_since_last_activity(&board) {
+                    let stalled = idle as u64 >= stall_idle;
+                    println!(
+                        "  idle: {idle}s since last activity (stall threshold {stall_idle}s){}",
+                        if stalled { " · ⚠ STALLED" } else { "" }
+                    );
+                    if stalled {
+                        warnings.push(format!(
+                            "board has been SILENT for {idle}s (>= stall threshold {stall_idle}s) — \
+                             the collaboration is stalled. Under `spriff serve` each side is nudged \
+                             to post a status sync; or post one yourself: `spriff post --status FYI`"
+                        ));
+                    }
+                }
+            } else {
+                println!("  idle: stall watchdog disabled ([stall] idle_secs = 0)");
+            }
+            println!(
+                "  ironclad: {} · proactive-review: {}",
+                if cfg.is_ironclad() {
+                    "on (serve is the recommended way to run a side)"
+                } else {
+                    "off (manual loop is primary)"
+                },
+                cfg.review_aggressiveness().as_str()
+            );
             println!("  agents:");
             let board_bytes = board::board_size(&board);
             let mut roster_classes: Vec<(String, Option<String>)> = Vec::new();
@@ -2031,8 +2693,19 @@ fn cmd_doctor(
                 } else {
                     ""
                 };
+                // Outstanding NON-acked nudges (informational, cleared on activity).
+                let stall_n = if nudge::exists(&sc.stall) {
+                    " · ⚠STALL nudge"
+                } else {
+                    ""
+                };
+                let review_n = if nudge::exists(&sc.review_nudge) {
+                    " · review nudge"
+                } else {
+                    ""
+                };
                 println!(
-                    "    {} ({role}): {unread} unread · cursor={}{serving}{class_str}{lens_str}{desync}",
+                    "    {} ({role}): {unread} unread · cursor={}{serving}{class_str}{lens_str}{desync}{stall_n}{review_n}",
                     a.persona, st.offset
                 );
                 roster_classes.push((a.persona.clone(), class));
@@ -2410,5 +3083,84 @@ mod tests {
         assert!(acquire_serve_lock(&board, "Bob").is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn supervise_label_is_filesystem_safe() {
+        assert_eq!(
+            supervise_label("Fix Checkout Flow!", "Pamela"),
+            "spriff.fix-checkout-flow.pamela"
+        );
+    }
+
+    #[test]
+    fn serve_argv_wraps_the_agent_command() {
+        let argv = serve_argv(
+            "/usr/local/bin/spriff",
+            "demo",
+            "Alice",
+            Some(std::path::Path::new("/x/demo.toml")),
+            &["codex".to_string(), "exec".to_string()],
+        );
+        // The wrapped command is `spriff serve --collab demo --as Alice --config … -- codex exec`.
+        assert_eq!(argv[0], "/usr/local/bin/spriff");
+        assert_eq!(argv[1], "serve");
+        assert!(argv.windows(2).any(|w| w == ["--collab", "demo"]));
+        assert!(argv.windows(2).any(|w| w == ["--as", "Alice"]));
+        assert!(argv.contains(&"--config".to_string()));
+        // Everything after the `--` separator is the agent command, in order.
+        let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&argv[sep + 1..], &["codex".to_string(), "exec".to_string()]);
+    }
+
+    #[test]
+    fn launchd_plist_is_ironclad_and_escaped() {
+        let argv = serve_argv(
+            "/bin/spriff",
+            "demo",
+            "Alice",
+            None,
+            &["claude".to_string(), "-p".to_string()],
+        );
+        let env = vec![("SPRIFF_HOME".to_string(), "/custom/home".to_string())];
+        let plist = launchd_plist(
+            "spriff.demo.alice",
+            &argv,
+            "/work/repo",
+            "/log/serve.log",
+            &env,
+        );
+        // RunAtLoad + KeepAlive is what makes the subscription survive crashes/boot.
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+        assert!(plist.contains("<key>KeepAlive</key><true/>"));
+        assert!(plist.contains("<string>serve</string>"));
+        assert!(plist.contains("<string>Alice</string>"));
+        assert!(plist.contains("<string>/log/serve.log</string>"));
+        // A custom SPRIFF_HOME rides along so the boot-time service finds the board.
+        assert!(plist.contains("<key>SPRIFF_HOME</key><string>/custom/home</string>"));
+        // Special chars in an arg are XML-escaped, never injected raw.
+        let dangerous = serve_argv("/bin/spriff", "demo", "A<&>B", None, &[]);
+        let p2 = launchd_plist("L", &dangerous, "/w", "/l", &[]);
+        assert!(p2.contains("A&lt;&amp;&gt;B"));
+        assert!(!p2.contains("A<&>B"));
+        // No env -> no EnvironmentVariables block.
+        assert!(!p2.contains("EnvironmentVariables"));
+    }
+
+    #[test]
+    fn systemd_unit_restarts_always_and_installs() {
+        let env = vec![("SPRIFF_HOME".to_string(), "/custom/home".to_string())];
+        let unit = systemd_unit(
+            "demo",
+            "Alice",
+            "/bin/spriff serve --as Alice -- codex exec",
+            "/work",
+            &env,
+        );
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("ExecStart=/bin/spriff serve --as Alice -- codex exec"));
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(unit.contains("WorkingDirectory=/work"));
+        assert!(unit.contains("Environment=SPRIFF_HOME=/custom/home"));
     }
 }
