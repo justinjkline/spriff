@@ -1402,28 +1402,49 @@ fn cmd_join(
     let stall_idle = cfg.stall_idle_secs();
     let stall_min = (stall_idle / 60).max(1);
     if cfg.is_ironclad() {
-        println!("\n═══════════ STEP 0 — SUBSCRIBE TO YOUR BOARD (do this FIRST) ═══════════");
-        println!("IRONCLAD MODE is the default, and a CLI agent is not a daemon: left on your own");
-        println!("you'll stop, hit a turn limit, or crash and silently strand the collaboration.");
         println!(
-            "So DON'T busy-poll, and DON'T hand-roll a launchd plist — subscribe the real way:"
+            "\n═══════════ STEP 0 — DECIDE WHO ACTS AS {me} (ask the operator FIRST) ═══════════"
+        );
+        println!(
+            "Before backgrounding anything, settle ONE question. If a HUMAN is in a live chat"
+        );
+        println!("with you right now, ASK them — do not assume. This is the #1 setup mistake:");
+        println!("an agent asked in a chat to \"set up spriff and review\" silently backgrounds a");
+        println!("SEPARATE agent, and the human loses the live session they wanted to steer.\n");
+        println!("  (A) THIS session is {me} — interactive / operator-steered.");
+        println!(
+            "      The agent the operator is already chatting with IS the persona. You run the"
+        );
+        println!("      loop yourself: inbox -> work -> post -> ack -> `spriff wait --as {me}`.");
+        println!(
+            "      The operator sees every turn and can interrupt to steer. In mode (A) do NOT"
+        );
+        println!("      run `spriff supervise`/`serve` — that spawns a DIFFERENT agent, not you.");
+        println!("  (B) A SEPARATE supervised process — hands-off / autonomous.");
+        println!(
+            "      A fresh headless agent spriff re-invokes once per peer turn, independent of"
+        );
+        println!("      this chat. The operator then reviews via the board, not this chat:");
+        println!("        ▶ PERSISTENT (restarts on crash, starts on boot):");
+        println!("              spriff supervise --as {me} --install -- <your-agent-cmd>");
+        println!("        ▶ FOREGROUND (one session you can watch):");
+        println!("              spriff serve --as {me} -- <your-agent-cmd>");
+        println!(
+            "          (<your-agent-cmd> is a headless agent, e.g. `claude -p` or `codex exec`.)"
         );
         println!();
-        println!("  ▶ PERSISTENT (best — restarts on crash, starts on boot):");
-        println!("        spriff supervise --as {me} --install -- <your-agent-cmd>");
-        println!("  ▶ FOREGROUND (one session, you can watch/chat):");
-        println!("        spriff serve --as {me} -- <your-agent-cmd>");
         println!(
-            "    (<your-agent-cmd> is your headless agent, e.g. `claude -p` or `codex exec`.)"
+            "⚠ `supervise`/`serve` BOTH start a NEW agent process — NOT the session you're in."
         );
-        println!();
+        println!("  If the operator wanted YOU (this session) to review, that is (A): run the");
+        println!("  `wait`-loop below and never background a supervisor.\n");
         println!(
-            "Either way spriff becomes the daemon and RE-INVOKES you once per peer turn, so you"
+            "If you chose (B), spriff becomes the daemon and RE-INVOKES that agent once per peer"
         );
         println!(
-            "do EXACTLY ONE turn per wake, then EXIT (no `spriff wait`, no polling). Also ON BY"
+            "turn, so it does EXACTLY ONE turn per wake then EXITS (no `spriff wait`). Also ON"
         );
-        println!("DEFAULT once subscribed:");
+        println!("BY DEFAULT once subscribed:");
         if stall_idle > 0 {
             println!(
                 "  • a STALL WATCHDOG pings everyone to resync if the board goes silent >{stall_min}min;"
@@ -1443,9 +1464,11 @@ fn cmd_join(
             );
             println!("    run `spriff touching <paths>` to point them at what you're building.");
         }
-        println!("\nConfirm you're subscribed anytime: `spriff status --as {me}` (shows \"subscribed: yes\").");
-        println!("Only if you truly can't be supervised, run the manual loop below as a FALLBACK.");
-        println!("\n═══════════ YOUR JOB — one turn each time you're woken ═══════════");
+        println!("\nConfirm a (B) subscription anytime: `spriff status --as {me}` (\"subscribed: yes\").");
+        println!("In mode (A) `subscribed: no` is EXPECTED — your own `wait`-loop is the engine.");
+        println!(
+            "\n═══════════ YOUR JOB — (A) run the loop below · (B) one turn per wake ═══════════"
+        );
     } else {
         println!("\n═══════════ YOUR JOB — run this loop, and NEVER stop on your own ═══════════");
     }

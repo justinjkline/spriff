@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Onboarding now forces the "who acts as this persona?" decision up front.**
+  `join` and `SKILL.md` previously jumped straight to `spriff supervise`/`serve`,
+  which silently spawns a SEPARATE headless agent — so an assistant asked, inside
+  a live chat, to "set up spriff and review" would background a different agent and
+  the operator would lose the session they wanted to steer. Step 0 now makes the
+  agent choose (and, if a human is present, ASK) between: (A) THIS session is the
+  persona — run the interactive `inbox -> work -> post -> ack -> wait` loop here,
+  no supervisor; or (B) a separate supervised process via `supervise`/`serve`. The
+  GOLDEN RULE section is reframed around "which mode are you in?", and clarifies
+  that `subscribed: no` is EXPECTED (not a failure) in mode (A).
 - `spriff ack` no longer swallows a peer turn that arrives mid-turn. Previously
   `ack` advanced the consume cursor to the LIVE board end (`offset =
   board_size()`), so a peer turn posted AFTER the agent read its inbox but BEFORE
