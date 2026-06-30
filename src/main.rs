@@ -1149,11 +1149,26 @@ fn pid_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn pid_is_alive(pid: u32) -> bool {
+    // No raw signal probe on Windows; consult the OS task table. `tasklist` prints a
+    // CSV row for a live pid and an "INFO: No tasks…" line otherwise (exit 0 either
+    // way), so the pid is alive iff its quoted id appears in the row.
+    match std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn pid_is_alive(_pid: u32) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn pid_command(pid: u32) -> Option<String> {
     let out = std::process::Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
@@ -1164,6 +1179,32 @@ fn pid_command(pid: u32) -> Option<String> {
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!s.is_empty()).then_some(s)
+}
+
+#[cfg(windows)]
+fn pid_command(pid: u32) -> Option<String> {
+    // The Windows analog of `ps -o command=`: the worker's full command line, so
+    // watch_daemon_running can confirm the pid is really our `--foreground` worker
+    // and not a recycled id. wmic is gone on modern Windows, so query CIM instead.
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pid_command(_pid: u32) -> Option<String> {
+    None
 }
 
 fn watch_daemon_running(board: &std::path::Path, persona: &str) -> Option<(u32, String)> {
@@ -1291,6 +1332,15 @@ fn cmd_watch_daemon(
         {
             let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
         }
+        #[cfg(windows)]
+        {
+            // No SIGTERM on Windows; taskkill terminates the worker and any child it
+            // spawned (/T). /F because the foreground worker blocks in a notify loop
+            // with no console to catch a Ctrl event, so a graceful request can't land.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
         for _ in 0..40 {
             if !pid_is_alive(pid) {
                 std::fs::remove_file(&pidfile).ok();
@@ -1299,9 +1349,15 @@ fn cmd_watch_daemon(
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        println!(
-            "watch-daemon: sent SIGTERM to pid {pid}, but it still appears alive; pidfile retained"
-        );
+        // Only reached if the process outlived the terminate request. Name the
+        // mechanism we actually used so the retained-pidfile diagnosis is honest.
+        #[cfg(unix)]
+        let how = "sent SIGTERM to";
+        #[cfg(windows)]
+        let how = "issued taskkill for";
+        #[cfg(not(any(unix, windows)))]
+        let how = "requested stop of";
+        println!("watch-daemon: {how} pid {pid}, but it still appears alive; pidfile retained");
         return Ok(());
     }
 
@@ -1351,6 +1407,43 @@ fn cmd_watch_daemon(
             libc::setsid();
             Ok(())
         });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // The Windows analog of setsid(). DETACHED_PROCESS (0x8) gives the worker no
+        // inherited console, so it isn't bound to the launcher's console; this is also
+        // what `CREATE_NEW_PROCESS_GROUP` (0x200) reinforces — its own Ctrl/signal group,
+        // the detachment from the caller's session that a new session gives us on Unix.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+
+        // Windows has no CLOEXEC, and std spawns with bInheritHandles=TRUE, so the
+        // long-lived worker would also inherit OUR std handles. When a caller wired our
+        // stdout/stderr to a pipe — exactly what `Command::output()` does — that
+        // inherited pipe write-end stays open in the worker forever, so the caller's
+        // read-to-EOF never returns and the launch appears to hang. (Unix is immune:
+        // pipe fds carry CLOEXEC and close across the exec.) Clear the inherit flag on
+        // our std handles before spawning; the worker still gets its own log-file
+        // handles, which std re-marks inheritable for this spawn.
+        unsafe {
+            extern "system" {
+                fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+                fn SetHandleInformation(h: *mut core::ffi::c_void, mask: u32, flags: u32) -> i32;
+            }
+            const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+            const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+            const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // (DWORD)-12
+            const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+            const INVALID_HANDLE_VALUE: isize = -1;
+            for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let h = GetStdHandle(which);
+                if !h.is_null() && h as isize != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
     }
     let child = cmd.spawn().context("starting watch-daemon worker")?;
     let pid = child.id();

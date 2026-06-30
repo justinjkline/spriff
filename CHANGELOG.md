@@ -123,6 +123,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like `C:\Users\…` was mis-parsed (`\U` read as a unicode escape) and every later
   command failed with `too few unicode value digits`. Paths are now emitted as TOML
   literal strings; added a `util::toml_string` helper and round-trip tests.
+- **Windows: `spriff watch-daemon` now actually daemonizes.** Start, `--status`, and
+  `--stop` were Unix-only — detach was a `libc::setsid()` `pre_exec`, liveness/identity
+  used `libc::kill`/`ps`, and stop sent `SIGTERM`; on Windows the `--foreground` worker
+  launched console-attached, so it never detached and the launcher hung holding an open
+  stdio pipe (the `watch_daemon_start_status_idempotent_signal_and_stop` test wedged).
+  The worker now spawns with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` (the setsid
+  analog), `pid_is_alive` probes via `tasklist`, `pid_command` reads the command line via
+  `Get-CimInstance Win32_Process` (wmic is gone on modern Windows), and `--stop` uses
+  `taskkill /T /F`. No new dependencies — same shell-out idiom the Unix path already used.
 
 ### Notes
 
