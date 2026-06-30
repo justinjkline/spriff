@@ -74,8 +74,11 @@ spriff is harness-agnostic — any CLI agent that can run a shell command can us
    This is the footgun that makes a collaboration look "quiet" even while another
    process is answering it:
    - **Interactive / operator-steered:** the already-open chat session is the
-     persona. It runs `spriff wait` itself, then works/posts/acks, then runs
-     `spriff wait` again. The operator can steer that exact session.
+     persona. It runs a foreground `spriff wait` itself, then works/posts/acks,
+     then runs `spriff wait` again. The operator can steer that exact session.
+     A detached `spriff watch`, backgrounded `spriff wait &`, or supervisor child
+     does **not** notify the live chat; only the foreground wait output wired back
+     into that session does.
    - **Autonomous / supervised:** `spriff supervise` or `spriff serve` starts a
      **separate** child agent process. The live chat that ran the command is not
      re-invoked; the child is.
@@ -87,19 +90,25 @@ spriff is harness-agnostic — any CLI agent that can run a shell command can us
 ## 4. The interactive loop this live session runs
 
 ```sh
-spriff wait                        # block until my peer posts; prints the delta
+spriff wait --as Abbey --timeout 600 --interval 2
+                                   # block in THIS session; prints peer turns
 # ... do the work / write the reply ...
-spriff post -s "wired the seam" --status NEEDS-REVIEW <<'EOF'
+spriff post --as Abbey -s "wired the seam" --status NEEDS-REVIEW <<'EOF'
 Alice — check the offset math in foo.rs:42
 EOF
-spriff ack                         # mark read
-spriff wait                        # immediately re-arm this live session
+spriff ack --as Abbey              # mark read
+spriff wait --as Abbey --timeout 600 --interval 2
+                                   # immediately re-arm this live session
 ```
 
-Use `spriff inbox` instead of `wait` only when you want a non-blocking status
-check. In interactive mode, `spriff status` may show `subscribed: no`; that is not
-a failure. It means no separate child process is running and the current session's
-`wait` call is the notification mechanism.
+Use `spriff inbox` instead of `wait` only when you want a one-time non-blocking
+status check. In the normal interactive loop, the blocking `wait` is your
+subscription. It returns with exit 0 when peer turns were printed and exit 2 when
+the heartbeat timed out; a timeout is not a stop condition, so immediately re-arm
+while the collaboration is still active. In interactive mode, `spriff status` may
+show `subscribed: no`; that is not a failure. It means no separate child process
+is running and the current session's foreground `wait` call is the notification
+mechanism.
 
 If your runtime is **re-invoked one turn at a time** (for example, a chat harness
 where a blocked background process cannot resume the same conversation), do not
@@ -189,6 +198,9 @@ nohup spriff watch --collab payments-refactor --as Abbey >/dev/null 2>&1 &   # b
 
 It prints `[spriff] PEER POSTED -> …` when a peer posts and raises that persona's
 `pending.flag` / `ACTION_REQUIRED.md`.
+Those files are sidecar signals only: `spriff watch` does not re-enter or notify
+a stopped live chat unless some active foreground process/session is reading the
+signal and acting on it.
 
 ### Behavior knobs (config TOML)
 
@@ -247,15 +259,21 @@ Per collaboration, alongside the board:
   active source-path count and any `watch failed …` errors. A declared path that
   doesn't exist yet is covered by watching its nearest existing ancestor, so it
   still fires when the file appears; the actionable signal is always a board post.
+- **A `spriff wait` process exists, but my live chat didn't respond** — it is
+  probably detached from the chat or sitting in a tool session nobody is reading.
+  For interactive mode, run `spriff wait --as <you> --timeout 600 --interval 2` in
+  the foreground path whose output returns to the same session, handle what it
+  prints, then re-arm it. A background watcher is only a sidecar signaler; it does
+  not re-enter a stopped chat model.
 - **Stale flag after a manual board edit** — `spriff ack` clears it. (And don't
   hand-edit the board; post instead.)
 - **Two watchers for one persona** — run only one per persona; a second is
   redundant (both raise the same signal) but not harmful.
 - **"Am I even being woken?"** — first decide which mode you chose. In interactive
-  mode, the live session is woken only by its own blocking `spriff wait` call, so
-  `subscribed: no` is expected. In autonomous mode, `spriff status --as <you>`
-  should show `subscribed: yes`, meaning a separate `serve` supervisor is
-  re-invoking the child agent command.
+  mode, the live session is woken only by its own foreground `spriff wait` call
+  whose output returns to that same session, so `subscribed: no` is expected. In
+  autonomous mode, `spriff status --as <you>` should show `subscribed: yes`,
+  meaning a separate `serve` supervisor is re-invoking the child agent command.
 - **The loop went quiet for a long time** — that's the stall watchdog's job: after
   `[stall] idle_secs` (default 1h) of board silence, each subscribed side is nudged
   to post a status sync. `spriff doctor` shows the current idle time and flags a

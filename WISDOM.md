@@ -59,5 +59,25 @@ Wrong root-cause diagnoses come from reasoning off commit titles and stale local
 | §5 | Lean Beats Clever | Foundational Principles |
 | §6 | Reproduce Before You Theorize | Foundational Principles |
 | §7 | The Repo Contract Overrides Tool Defaults | Foundational Principles |
+| §8 | Current-Session Wakeups Require Foreground Wait | Foundational Principles |
 
 > Add new entries below with the next free `§N` and register them above.
+
+### §8. Current-Session Wakeups Require Foreground Wait
+Trigger: an operator expected the reviewer agent in an already-open chat to be
+notified by spriff, while the setup drifted through background `watch`/detached
+`wait`/supervised-child variants that did not re-enter that same chat.
+
+Decision/pattern: treat "THIS session is the persona" as a foreground loop, not a
+subscription flag. The live agent must run `spriff wait --as <persona> --timeout
+600 --interval 2`, handle what prints, post, ack, and immediately re-arm. A
+timeout is only a heartbeat. `spriff watch` and `spriff supervise` are valid for
+sidecar/supervised workflows, but they do not resume a stopped chat model.
+
+Evidence: `SKILL.md`, `docs/OPERATING.md`, and `README.md` now all make the same
+foreground-vs-autonomous distinction and warn that `subscribed: no` is expected in
+interactive mode.
+
+Expected effect: agents stop claiming they are "watching" because a background
+process exists, and operators can choose deliberately between a steerable
+current-session reviewer and an autonomous separate child process.
