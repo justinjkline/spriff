@@ -811,13 +811,22 @@ fn supervise_prints_a_serve_wrapping_unit_without_installing() {
     assert!(out.contains("serve"), "should wrap serve:\n{out}");
     assert!(out.contains("Abbey"), "should name the persona:\n{out}");
     assert!(out.contains("suptest"), "should name the collab:\n{out}");
+    // The wrapped `serve` must carry the explicit autonomous opt-in, or the
+    // installed service's own `serve` would refuse to start at boot.
+    assert!(
+        out.contains("--autonomous"),
+        "wrapped serve must carry the autonomous opt-in:\n{out}"
+    );
     // Without --install it must NOT claim to have loaded/enabled anything.
     assert!(
         !out.contains("now subscribed"),
         "must not install without --install:\n{out}"
     );
 
-    // An off-roster persona is refused (same guard as serve).
+    // An off-roster persona is refused. We pass --autonomous so the command gets
+    // PAST the spawn-opt-in guard and actually reaches the off-roster check —
+    // otherwise it would bail on the (earlier) autonomous guard and this would no
+    // longer exercise the roster validation it claims to.
     let bad = sb.run(
         &cwd,
         &[
@@ -826,6 +835,7 @@ fn supervise_prints_a_serve_wrapping_unit_without_installing() {
             "suptest",
             "--as",
             "Zelda",
+            "--autonomous",
             "--",
             "echo",
             "hi",

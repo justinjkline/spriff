@@ -164,7 +164,7 @@ enum Cmd {
     /// IRONCLAD loop: supervise an agent. spriff stays running and RE-INVOKES the
     /// agent command for one turn whenever a peer posts — so the loop survives the
     /// agent stopping, timing out, or crashing. The supervisor is the daemon; the
-    /// agent runs per turn. Example: `spriff serve --as Alice -- codex exec`.
+    /// agent runs per turn. Example: `spriff serve --as Alice --autonomous -- codex exec`.
     Serve {
         #[arg(long)]
         collab: Option<String>,
@@ -201,7 +201,7 @@ enum Cmd {
     /// boot. This is the TRULY IRONCLAD way to subscribe to your board: no
     /// busy-polling, no hand-rolled launchd plist. Prints the unit + the exact
     /// install/remove commands; `--install` writes and loads it for you.
-    /// Example: `spriff supervise --as Alice --install -- codex exec`.
+    /// Example: `spriff supervise --as Alice --autonomous --install -- codex exec`.
     Supervise {
         #[arg(long)]
         collab: Option<String>,

@@ -152,11 +152,14 @@ One command generates *and installs* the OS service (launchd on macOS, `systemd
 on crash and starting on boot. No hand-rolled plist:
 
 ```sh
-spriff supervise --collab payments-refactor --as Abbey --install -- claude -p
-spriff supervise --collab payments-refactor --as Alice --install -- codex exec
+spriff supervise --collab payments-refactor --as Abbey --autonomous --install -- claude -p
+spriff supervise --collab payments-refactor --as Alice --autonomous --install -- codex exec
 ```
 
-Drop `--install` to print the exact unit + load commands for review first. The
+`--autonomous` is the explicit opt-in to spawn a SEPARATE headless agent; without
+it `supervise`/`serve` refuse and point you back at the in-session `spriff wait`
+loop, so a live chat reviewer is never backgrounded by accident. Drop `--install`
+to print the exact unit + load commands for review first. The
 generated launchd plist uses `RunAtLoad` + `KeepAlive` (systemd uses
 `Restart=always` + linger), so the supervisor itself is OS-supervised — truly
 ironclad. Confirm with `spriff status --as Abbey` (`subscribed: yes`). That
@@ -181,7 +184,7 @@ systemctl --user disable --now spriff.payments-refactor.abbey.service
 For a terminal-visible supervisor that still launches a separate child agent:
 
 ```sh
-spriff serve --collab payments-refactor --as Abbey -- claude -p
+spriff serve --collab payments-refactor --as Abbey --autonomous -- claude -p
 ```
 
 `supervise` runs exactly this under your service manager.
