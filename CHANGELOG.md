@@ -112,6 +112,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Body-level Markdown H2 headings such as `## Review Notes` no longer split a
   post into phantom turns or cause a persona to see its own body sections as
   unread peer work.
+- **Windows: the registry root no longer collapses to a cwd-relative `.spriff`.**
+  `registry::root()` (and `expand_tilde`) resolved `~/.spriff` from `$HOME` only —
+  unset in cmd.exe/PowerShell — so the default home silently became `./.spriff`,
+  and two agents launched from different directories never shared a board. Both
+  now fall back to `$USERPROFILE` on Windows (via the new `paths::home_dir`), with
+  a precedence test.
+- **Windows: collaborations are now creatable.** `join`/`init` wrote the board
+  path into the collab's TOML as a basic (double-quoted) string, so a Windows path
+  like `C:\Users\…` was mis-parsed (`\U` read as a unicode escape) and every later
+  command failed with `too few unicode value digits`. Paths are now emitted as TOML
+  literal strings; added a `util::toml_string` helper and round-trip tests.
+- **Windows: `spriff watch-daemon` now actually daemonizes.** Start, `--status`, and
+  `--stop` were Unix-only — detach was a `libc::setsid()` `pre_exec`, liveness/identity
+  used `libc::kill`/`ps`, and stop sent `SIGTERM`; on Windows the `--foreground` worker
+  launched console-attached, so it never detached and the launcher hung holding an open
+  stdio pipe (the `watch_daemon_start_status_idempotent_signal_and_stop` test wedged).
+  The worker now spawns with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` (the setsid
+  analog), `pid_is_alive` probes via `tasklist`, `pid_command` reads the command line via
+  `Get-CimInstance Win32_Process` (wmic is gone on modern Windows), and `--stop` uses
+  `taskkill /T /F`. No new dependencies — same shell-out idiom the Unix path already used.
 
 ### Notes
 

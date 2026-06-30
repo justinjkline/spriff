@@ -15,6 +15,25 @@ pub fn utc_stamp() -> String {
     chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
+/// Quote `s` as a valid TOML string value (the part after `key = `).
+///
+/// The reason this exists: a Windows path like `C:\Users\me\board.md` written
+/// into a TOML *basic* string (double quotes) is mis-parsed — `\U` reads as the
+/// start of a `\Uxxxxxxxx` unicode escape and the load fails with "too few
+/// unicode value digits". TOML's own answer for paths is a *literal* string
+/// (single quotes), which performs no escape processing — so backslashes survive
+/// verbatim. We use a literal whenever we can; only if the value itself contains
+/// a single quote or newline (which a literal cannot represent) do we fall back
+/// to a basic string with `\` and `"` properly escaped.
+pub fn toml_string(s: &str) -> String {
+    if !s.contains('\'') && !s.contains('\n') {
+        format!("'{s}'")
+    } else {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    }
+}
+
 /// Write a file atomically: write to a sibling temp file, then rename over the
 /// target. A concurrent reader (e.g. an agent opening `pending.md`) therefore
 /// always sees either the old complete file or the new complete file — never a
@@ -69,4 +88,30 @@ pub fn newest_mtime(roots: &[PathBuf]) -> Option<SystemTime> {
         }
     }
     newest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_string_roundtrips_a_windows_path() {
+        // The regression: a backslash path in a basic string made `\U` look like
+        // a unicode escape and broke config load on Windows. The value must come
+        // back byte-for-byte after a real parse.
+        let p = r"C:\Users\alexr\AppData\Local\Temp\h\demo.board.md";
+        let toml = format!("board = {}\n", toml_string(p));
+        let parsed: toml::Table = toml::from_str(&toml).expect("must parse");
+        assert_eq!(parsed["board"].as_str().unwrap(), p);
+    }
+
+    #[test]
+    fn toml_string_escapes_values_a_literal_cannot_hold() {
+        // A single quote can't live in a literal string, so we fall back to an
+        // escaped basic string — and that, too, must round-trip exactly.
+        let weird = "a'b\"c\\d";
+        let toml = format!("v = {}\n", toml_string(weird));
+        let parsed: toml::Table = toml::from_str(&toml).expect("must parse");
+        assert_eq!(parsed["v"].as_str().unwrap(), weird);
+    }
 }
