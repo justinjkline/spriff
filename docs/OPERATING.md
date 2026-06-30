@@ -198,6 +198,9 @@ nohup spriff watch --collab payments-refactor --as Abbey >/dev/null 2>&1 &   # b
 
 It prints `[spriff] PEER POSTED -> …` when a peer posts and raises that persona's
 `pending.flag` / `ACTION_REQUIRED.md`.
+Those files are sidecar signals only: `spriff watch` does not re-enter or notify
+a stopped live chat unless some active foreground process/session is reading the
+signal and acting on it.
 
 ### Behavior knobs (config TOML)
 
