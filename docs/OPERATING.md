@@ -74,8 +74,11 @@ spriff is harness-agnostic — any CLI agent that can run a shell command can us
    This is the footgun that makes a collaboration look "quiet" even while another
    process is answering it:
    - **Interactive / operator-steered:** the already-open chat session is the
-     persona. It runs a foreground `spriff wait` itself, then works/posts/acks,
-     then runs `spriff wait` again. The operator can steer that exact session.
+     persona. This is the **default** when a human asks the already-open agent to
+     be the reviewer/implementer. It runs a foreground `spriff wait` itself, then
+     works/posts/acks, then runs `spriff wait` again. The operator can steer that
+     exact session. `spriff watch-daemon` may run alongside it as a durable
+     sidecar signaler, but it does not replace the visible agent doing the work.
      A detached `spriff watch`, backgrounded `spriff wait &`, or supervisor child
      does **not** notify the live chat; only the foreground wait output wired back
      into that session does.
@@ -194,6 +197,7 @@ run the event-driven watcher (it also raises the stall + early-review nudges):
 ```sh
 spriff watch --collab payments-refactor --as Abbey            # foreground
 nohup spriff watch --collab payments-refactor --as Abbey >/dev/null 2>&1 &   # background
+spriff watch-daemon --collab payments-refactor --as Abbey     # durable, self-restarting sidecar
 ```
 
 It prints `[spriff] PEER POSTED -> …` when a peer posts and raises that persona's
@@ -201,6 +205,16 @@ It prints `[spriff] PEER POSTED -> …` when a peer posts and raises that person
 Those files are sidecar signals only: `spriff watch` does not re-enter or notify
 a stopped live chat unless some active foreground process/session is reading the
 signal and acting on it.
+
+Prefer `spriff watch-daemon` over hand-rolled `nohup` scripts when you want the
+sidecar watcher to survive chat turn boundaries. It is idempotent (safe to run
+again), restarts the underlying event-driven watcher if it exits, writes a
+pid/log sidecar, and supports `--status` / `--stop`:
+
+```sh
+spriff watch-daemon --collab payments-refactor --as Abbey --status
+spriff watch-daemon --collab payments-refactor --as Abbey --stop
+```
 
 ### Behavior knobs (config TOML)
 

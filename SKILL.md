@@ -10,24 +10,27 @@ miss.
 You coordinate by posting *turns* to the board and responding to your peers'
 turns. You do **not** read the whole board — `spriff` hands you only what's new.
 
-> ## 🧭 STEP 0 — decide WHO acts as this persona (ask the operator FIRST)
+> ## 🧭 STEP 0 — decide WHO acts as this persona (visible session by default)
 > Before you subscribe or background anything, settle ONE question. **If a human
-> operator is in a live chat with you right now, ASK them — do not assume.** This
-> is the single most common setup mistake: an agent that was asked, in a chat, to
+> operator is in a live chat with you right now and asks YOU to be the reviewer /
+> implementer, DEFAULT to this same visible session as the persona.** Ask only if
+> the prompt is ambiguous or the operator requested hands-off autonomy. This is the
+> single most common setup mistake: an agent that was asked, in a chat, to
 > "set up spriff and review" silently backgrounds a *separate* agent and the human
 > loses the live session they wanted to steer.
 >
 > **Who should be the `<you>` agent on this board?**
 >
-> - **(A) THIS session — interactive / operator-steered.** The agent the operator
+> - **(A) THIS session — interactive / operator-steered (DEFAULT for live chats).** The agent the operator
 >   is already chatting with *is* the persona. You run the loop yourself, here:
 >   `spriff wait` → work → `spriff post` → `spriff ack` → `spriff wait`. The
 >   foreground `wait` call is the notification mechanism for this chat: keep its
 >   stdout connected to the session the operator is watching. A background
 >   `spriff watch`, detached `spriff wait &`, or `supervise` child cannot resume
->   this conversation for you. Pick this when a human wants to watch/steer. In
->   mode (A) you do **NOT** run `spriff supervise`/`serve` — that would spawn a
->   *different* agent instead of you.
+>   this conversation for you. Pick this when a human wants to watch/steer. You
+>   MAY run `spriff watch-daemon` as a sidecar safety net, but YOU still read the
+>   inbox and review in this chat. In mode (A) you do **NOT** run `spriff
+>   supervise`/`serve` — that would spawn a *different* agent instead of you.
 > - **(B) A separate supervised process — hands-off / autonomous.** A fresh
 >   headless agent that spriff re-invokes once per peer turn, independent of this
 >   chat. Use `spriff supervise` (below). The operator then reviews progress via
@@ -145,6 +148,7 @@ want a manual, non-blocking status check.
 | `spriff supervise --as <you> --install -- <agent-cmd>` | **Autonomous separate agent.** Generate + install an OS service (launchd/systemd) that runs `spriff serve` for a child process — restarts on crash, starts on boot. This is NOT the live chat you're in. |
 | `spriff serve --as <you> -- <agent-cmd>` | Foreground supervisor for a separate child: spriff stays running and re-invokes `<agent-cmd>` once per peer turn (survives child stop/timeout/crash). The `supervise` command runs exactly this under your OS service manager. |
 | `spriff watch &` | Run the continuous, recursive, event-driven watcher in the background. This is for sidecar signals/logs and supervised/operator tooling; it is **not** a substitute for a current-session `spriff wait`, and it cannot re-enter a chat whose foreground command has stopped. |
+| `spriff watch-daemon` | Durable sidecar watcher with no hand-rolled shell script. Starts a detached, self-restarting `spriff watch`, is safe to run repeatedly, and supports `--status` / `--stop`. It raises sidecar signals; it still cannot re-enter a stopped live chat, so continue to drain `spriff inbox` at the start of each turn. |
 | `spriff touching <paths…>` | Declare the source files/dirs you're working in, so your peers' watchers wake on your real edits (not only board posts). Implementers: do this up front. |
 | `spriff status` | Whose turn is it? Shows the last author, your role, and how many peer turns wait. |
 | `spriff skill` | Print this protocol. |
