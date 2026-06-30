@@ -469,8 +469,25 @@ fn main() -> Result<()> {
             foreground,
             restart_delay,
         } => {
-            let (cfg, name) = resolve(collab, config.clone())?;
+            let (cfg, name) = resolve(collab.clone(), config.clone())?;
             let persona = resolve_persona(as_persona, &cfg);
+            // Forward to the DETACHED child exactly the config the launcher resolved
+            // with, mirroring resolve()'s precedence: an explicit --config, or an
+            // inherited $SPRIFF_CONFIG (honoured ONLY when no --collab was given).
+            // The child re-runs `watch-daemon --collab <name>`, and clap's --collab
+            // would make its own resolve() ignore $SPRIFF_CONFIG — so a non-registry,
+            // config-file board would resolve in the launcher yet the child would bail
+            // (the same hazard run_agent fixes by propagating SPRIFF_CONFIG).
+            let fwd_config = config.clone().or_else(|| {
+                if collab.is_some() {
+                    None
+                } else {
+                    std::env::var("SPRIFF_CONFIG")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                }
+            });
             cmd_watch_daemon(
                 &cfg,
                 &name,
@@ -479,7 +496,7 @@ fn main() -> Result<()> {
                 stop,
                 foreground,
                 restart_delay,
-                config,
+                fwd_config,
             )
         }
         Cmd::Serve {
@@ -1050,6 +1067,52 @@ fn watch_daemon_log_path(board: &std::path::Path, persona: &str) -> PathBuf {
     ))
 }
 
+/// Advisory lock guarding the watch-daemon START critical section:
+/// `<base>.<persona>.watch-daemon.lock`, next to the other sidecars.
+fn watch_daemon_lock_path(board: &std::path::Path, persona: &str) -> PathBuf {
+    let state = Sidecars::derive(board, persona).state;
+    let s = state.to_string_lossy();
+    PathBuf::from(format!(
+        "{}watch-daemon.lock",
+        s.trim_end_matches("watch.state")
+    ))
+}
+
+/// Serialize concurrent `watch-daemon` LAUNCHES for one (collab, persona) so that
+/// the check-then-spawn is atomic. Without this lock, N simultaneous launches each
+/// observe "not running", each spawn their own detached `--foreground` worker, and
+/// the pidfile records only the last writer — orphaning the rest as live watchers
+/// that `--stop` can never reap (it only knows the pid in the file). The KERNEL
+/// arbitrates the flock (via fs2) and releases it on drop/process death, so there
+/// is no path-based TOCTOU and no stale-lock reclaim. This is the same idiom serve
+/// uses (`acquire_serve_lock`) and first-join uses (`with_create_lock`).
+///
+/// The launcher holds this only across the brief check→spawn→pidfile→verify window;
+/// the long-lived `--foreground` worker does NOT hold it, so a blocking acquire
+/// here can never deadlock against a running daemon.
+fn acquire_watch_daemon_start_lock(
+    board: &std::path::Path,
+    persona: &str,
+) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    let path = watch_daemon_lock_path(board, persona);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening watch-daemon lock {}", path.display()))?;
+    // Block until we own it; a concurrent launcher waits here, then observes the
+    // daemon the winner started and takes the idempotent "already running" path.
+    file.lock_exclusive()
+        .with_context(|| format!("locking watch-daemon lock {}", path.display()))?;
+    Ok(file)
+}
+
 fn read_pid(path: &std::path::Path) -> Option<u32> {
     std::fs::read_to_string(path)
         .ok()
@@ -1171,7 +1234,12 @@ fn cmd_watch_daemon(
                     eprintln!("[spriff] inner watch failed: {e:#}; restarting in {restart_delay}s")
                 }
             }
-            std::thread::sleep(Duration::from_secs(restart_delay));
+            // Floor the restart cadence at 1s. `watcher::run` normally BLOCKS
+            // forever, so we only reach here on an exit/error; if it were to fail
+            // instantly and persistently (e.g. a broken notify backend), an
+            // unfloored `--restart-delay 0` would busy-spin at 100% CPU and flood
+            // the log. The floor costs nothing in the normal (rare-restart) case.
+            std::thread::sleep(Duration::from_secs(restart_delay.max(1)));
         }
     }
 
@@ -1216,6 +1284,12 @@ fn cmd_watch_daemon(
         );
         return Ok(());
     }
+
+    // Hold the start lock across the WHOLE check→spawn→pidfile→verify window so
+    // concurrent launches can't each spawn a worker (see acquire_watch_daemon_start_lock).
+    // Released when `_start_lock` drops at function return; the spawned worker does
+    // not inherit or hold it.
+    let _start_lock = acquire_watch_daemon_start_lock(&board, persona)?;
 
     if let Some((pid, _cmd)) = watch_daemon_running(&board, persona) {
         println!("watch-daemon: already running (pid {pid})");
@@ -1262,7 +1336,20 @@ fn cmd_watch_daemon(
     let pid = child.id();
     std::fs::write(&pidfile, pid.to_string())
         .with_context(|| format!("writing {}", pidfile.display()))?;
+    // Verify the worker survived startup before claiming success. A child that dies
+    // instantly (e.g. an unresolved collab/config in the detached process) would
+    // otherwise leave us printing "started" over a stale pidfile that `--status`
+    // later reports as dead. We're still under `_start_lock`, so a concurrent
+    // launcher can't observe this half-built state.
     std::thread::sleep(Duration::from_millis(150));
+    if !pid_is_alive(pid) {
+        std::fs::remove_file(&pidfile).ok();
+        anyhow::bail!(
+            "watch-daemon worker (pid {pid}) exited immediately during startup; \
+             see the log for why: {}",
+            log.display()
+        );
+    }
     println!("watch-daemon: started pid {pid}");
     println!("  log: {}", log.display());
     println!("  status: spriff watch-daemon --collab {name} --as {persona} --status");
@@ -3505,6 +3592,44 @@ mod tests {
             watch_daemon_log_path(Path::new("/x/foo.board.md"), "Alice"),
             PathBuf::from("/x/foo.alice.watch-daemon.log")
         );
+        assert_eq!(
+            watch_daemon_lock_path(Path::new("/x/foo.board.md"), "Alice"),
+            PathBuf::from("/x/foo.alice.watch-daemon.lock")
+        );
+    }
+
+    // The start lock is what serializes concurrent `watch-daemon` launches so only
+    // ONE detached worker is ever spawned per persona — without it, simultaneous
+    // launches each spawn a worker and orphan all but the last (which `--stop`
+    // can't reap). Prove the flock is genuinely exclusive while held and frees on drop.
+    #[test]
+    fn watch_daemon_start_lock_is_exclusive_then_releasable() {
+        use fs2::FileExt;
+        let dir = std::env::temp_dir().join(format!("spriff-wdlock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let board = dir.join("t.board.md");
+        std::fs::write(&board, "x").unwrap();
+
+        let held = acquire_watch_daemon_start_lock(&board, "Alice").unwrap();
+        // A separate handle on the SAME lock inode must not be grabbable while held.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(watch_daemon_lock_path(&board, "Alice"))
+            .unwrap();
+        assert!(
+            probe.try_lock_exclusive().is_err(),
+            "watch-daemon start lock must be exclusive while held"
+        );
+        drop(held); // releases the OS lock
+        assert!(
+            probe.try_lock_exclusive().is_ok(),
+            "lock must be re-acquirable once the holder drops"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
