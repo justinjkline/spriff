@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Spawning a SEPARATE agent is now an explicit opt-in (`--autonomous`).** `spriff serve` and `spriff supervise` both start a separate, headless agent process — NOT the live chat/session the operator is in. That is exactly how an agent asked in a chat to "set up spriff and review" silently backgrounded a second agent the human could neither see nor steer. Both commands now **refuse unless `--autonomous` is passed**, and the refusal names the in-session path (`spriff wait --as <you>`) so the chat session a human is steering stays the reviewer by default. The OS service `supervise` installs carries `--autonomous` in its wrapped `serve` argv, so genuine autonomous mode is unchanged; only a bare, un-opted-in `serve`/`supervise` is blocked. Tests: `cmd_serve_refuses_without_autonomous_opt_in`, `cmd_supervise_refuses_without_autonomous_opt_in`, and `serve_argv_wraps_the_agent_command` now asserts the opt-in rides along.
+
 ### Added
 
 - **Ironclad mode on by default** (`[loop] ironclad`, default `true`). `join` now
@@ -17,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service that runs `spriff serve` for a persona: launchd (`RunAtLoad` +
   `KeepAlive`) on macOS, `systemd --user` (`Restart=always` + linger) on Linux. The
   canonical "make it ironclad" artifact — no hand-written plist.
+- **`spriff watch-daemon`** — an idempotent, self-restarting local sidecar watcher
+  for operators who need durable board/file notifications but do NOT want a
+  separate supervised child agent. It starts a detached `spriff watch` supervisor,
+  records pid/log sidecars, restarts the watcher if it exits, supports
+  `--status`/`--stop`, and is surfaced in `spriff status` so nobody has to
+  hand-roll `nohup spriff watch ... &` scripts.
 - **Inactivity (stall) watchdog** (`[stall] idle_secs`, default 3600, `0` = off).
   When the board goes silent past the threshold, both `serve` and `watch` ping the
   local agent to post a status update + recommend next steps, so a stalled loop
@@ -56,6 +66,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interactive `spriff wait` loop. `serve`/`supervise`, README, OPERATING, and the
   embedded SKILL protocol now all describe the same foreground-vs-autonomous
   choice.
+- **Agent docs now spell out the current-session wait loop.** The README,
+  OPERATING guide, and embedded SKILL protocol make the working interactive mode
+  explicit: run foreground `spriff wait --as <persona> --timeout 600 --interval 2`,
+  handle/post/ack, then immediately re-arm. They also call out that `spriff watch`,
+  detached `wait`, and supervised children cannot notify or resume the live chat
+  the operator is steering.
+- **Live chat agents now default to visible current-session ownership.** The
+  join/onboarding output and protocol docs make the default explicit: if a human
+  asks the already-open agent to be the reviewer/implementer, that chat session is
+  the persona. `watch-daemon` is a sidecar safety net; `serve`/`supervise` are an
+  explicit opt-in to a separate autonomous agent.
 - **Shell pipelines no longer emit broken-pipe panic noise.** Unix builds restore
   default `SIGPIPE` handling at startup, so common checks like
   `spriff status | grep -q subscribed` terminate quietly when the reader exits

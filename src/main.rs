@@ -161,10 +161,39 @@ enum Cmd {
         as_persona: Option<String>,
     },
 
+    /// Keep the event-driven watcher running as a DETACHED, self-restarting
+    /// local daemon. This is the first-class replacement for hand-rolled
+    /// `nohup spriff watch ... &` scripts: safe to run repeatedly (idempotent),
+    /// writes a pidfile + log next to the board sidecars, and restarts `watch`
+    /// if it ever exits. It raises durable sidecar signals; it does not spawn a
+    /// separate agent process (use `supervise` for that).
+    WatchDaemon {
+        #[arg(long)]
+        collab: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Watch as this persona (defaults to the config's `me`).
+        #[arg(long = "as")]
+        as_persona: Option<String>,
+        /// Print daemon status and exit.
+        #[arg(long)]
+        status: bool,
+        /// Ask the daemon to stop (SIGTERM on Unix) and exit.
+        #[arg(long)]
+        stop: bool,
+        /// Internal: run the daemon supervisor in the foreground. `watch-daemon`
+        /// starts this detached for you; humans normally do not pass it.
+        #[arg(long, hide = true)]
+        foreground: bool,
+        /// Seconds to wait before restarting `spriff watch` after an exit.
+        #[arg(long, default_value_t = 2)]
+        restart_delay: u64,
+    },
+
     /// IRONCLAD loop: supervise an agent. spriff stays running and RE-INVOKES the
     /// agent command for one turn whenever a peer posts — so the loop survives the
     /// agent stopping, timing out, or crashing. The supervisor is the daemon; the
-    /// agent runs per turn. Example: `spriff serve --as Alice -- codex exec`.
+    /// agent runs per turn. Example: `spriff serve --as Alice --autonomous -- codex exec`.
     Serve {
         #[arg(long)]
         collab: Option<String>,
@@ -182,6 +211,14 @@ enum Cmd {
         /// future peer turns.
         #[arg(long)]
         no_kickoff: bool,
+        /// Spawn a SEPARATE, headless autonomous agent (a NEW process that is NOT
+        /// the live chat/session you are in). REQUIRED to start one: without it
+        /// `serve` refuses and points you at the in-session `spriff wait` loop, so
+        /// the session a human is steering stays the agent. This is the guard that
+        /// stops an agent asked in chat to "review" from silently backgrounding a
+        /// second agent the operator can't see.
+        #[arg(long)]
+        autonomous: bool,
         /// The agent command to run per turn (everything after `--`). spriff
         /// appends a wake prompt as the final argument. e.g. `-- claude -p`.
         #[arg(last = true, required = true)]
@@ -193,7 +230,7 @@ enum Cmd {
     /// boot. This is the TRULY IRONCLAD way to subscribe to your board: no
     /// busy-polling, no hand-rolled launchd plist. Prints the unit + the exact
     /// install/remove commands; `--install` writes and loads it for you.
-    /// Example: `spriff supervise --as Alice --install -- codex exec`.
+    /// Example: `spriff supervise --as Alice --autonomous --install -- codex exec`.
     Supervise {
         #[arg(long)]
         collab: Option<String>,
@@ -208,6 +245,13 @@ enum Cmd {
         /// unit is only printed for you to review/install yourself).
         #[arg(long)]
         install: bool,
+        /// Install a SEPARATE, headless autonomous agent as an OS service (NOT the
+        /// live chat/session you are in). REQUIRED: without it `supervise` refuses
+        /// and points you at `spriff wait` for in-session review. The generated
+        /// service always runs in autonomous mode, so this flag is the operator's
+        /// explicit "yes, background a second agent" confirmation.
+        #[arg(long)]
+        autonomous: bool,
         /// The agent command to supervise (everything after `--`), exactly as for
         /// `serve`. e.g. `-- claude -p`.
         #[arg(last = true, required = true)]
@@ -431,6 +475,45 @@ fn main() -> Result<()> {
             let persona = resolve_persona(as_persona, &cfg);
             watcher::run(&cfg, &persona)
         }
+        Cmd::WatchDaemon {
+            collab,
+            config,
+            as_persona,
+            status,
+            stop,
+            foreground,
+            restart_delay,
+        } => {
+            let (cfg, name) = resolve(collab.clone(), config.clone())?;
+            let persona = resolve_persona(as_persona, &cfg);
+            // Forward to the DETACHED child exactly the config the launcher resolved
+            // with, mirroring resolve()'s precedence: an explicit --config, or an
+            // inherited $SPRIFF_CONFIG (honoured ONLY when no --collab was given).
+            // The child re-runs `watch-daemon --collab <name>`, and clap's --collab
+            // would make its own resolve() ignore $SPRIFF_CONFIG — so a non-registry,
+            // config-file board would resolve in the launcher yet the child would bail
+            // (the same hazard run_agent fixes by propagating SPRIFF_CONFIG).
+            let fwd_config = config.clone().or_else(|| {
+                if collab.is_some() {
+                    None
+                } else {
+                    std::env::var("SPRIFF_CONFIG")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                }
+            });
+            cmd_watch_daemon(
+                &cfg,
+                &name,
+                &persona,
+                status,
+                stop,
+                foreground,
+                restart_delay,
+                fwd_config,
+            )
+        }
         Cmd::Serve {
             collab,
             config,
@@ -438,6 +521,7 @@ fn main() -> Result<()> {
             idle_timeout,
             poll,
             no_kickoff,
+            autonomous,
             agent_cmd,
         } => {
             let (cfg, name) = resolve(collab, config.clone())?;
@@ -449,6 +533,7 @@ fn main() -> Result<()> {
                 idle_timeout,
                 poll,
                 !no_kickoff,
+                autonomous,
                 &agent_cmd,
                 config,
             )
@@ -459,11 +544,14 @@ fn main() -> Result<()> {
             as_persona,
             label,
             install,
+            autonomous,
             agent_cmd,
         } => {
             let (cfg, name) = resolve(collab, config.clone())?;
             let persona = resolve_persona(as_persona, &cfg);
-            cmd_supervise(&cfg, &name, &persona, label, install, &agent_cmd, config)
+            cmd_supervise(
+                &cfg, &name, &persona, label, install, autonomous, &agent_cmd, config,
+            )
         }
         Cmd::Post {
             collab,
@@ -978,6 +1066,317 @@ fn acquire_serve_lock(board: &std::path::Path, persona: &str) -> Result<ServeLoc
     }
 }
 
+/// Sidecar pidfile for the local `spriff watch-daemon` supervisor.
+fn watch_daemon_pid_path(board: &std::path::Path, persona: &str) -> PathBuf {
+    let state = Sidecars::derive(board, persona).state; // <base>.<persona>.watch.state
+    let s = state.to_string_lossy();
+    PathBuf::from(format!(
+        "{}watch-daemon.pid",
+        s.trim_end_matches("watch.state")
+    ))
+}
+
+/// Sidecar log for the daemon wrapper itself. The inner watcher still writes
+/// `<base>.<persona>.watch.log`; this records supervisor restarts/lifecycle.
+fn watch_daemon_log_path(board: &std::path::Path, persona: &str) -> PathBuf {
+    let state = Sidecars::derive(board, persona).state;
+    let s = state.to_string_lossy();
+    PathBuf::from(format!(
+        "{}watch-daemon.log",
+        s.trim_end_matches("watch.state")
+    ))
+}
+
+/// Advisory lock guarding the watch-daemon START critical section:
+/// `<base>.<persona>.watch-daemon.lock`, next to the other sidecars.
+fn watch_daemon_lock_path(board: &std::path::Path, persona: &str) -> PathBuf {
+    let state = Sidecars::derive(board, persona).state;
+    let s = state.to_string_lossy();
+    PathBuf::from(format!(
+        "{}watch-daemon.lock",
+        s.trim_end_matches("watch.state")
+    ))
+}
+
+/// Serialize concurrent `watch-daemon` LAUNCHES for one (collab, persona) so that
+/// the check-then-spawn is atomic. Without this lock, N simultaneous launches each
+/// observe "not running", each spawn their own detached `--foreground` worker, and
+/// the pidfile records only the last writer — orphaning the rest as live watchers
+/// that `--stop` can never reap (it only knows the pid in the file). The KERNEL
+/// arbitrates the flock (via fs2) and releases it on drop/process death, so there
+/// is no path-based TOCTOU and no stale-lock reclaim. This is the same idiom serve
+/// uses (`acquire_serve_lock`) and first-join uses (`with_create_lock`).
+///
+/// The launcher holds this only across the brief check→spawn→pidfile→verify window;
+/// the long-lived `--foreground` worker does NOT hold it, so a blocking acquire
+/// here can never deadlock against a running daemon.
+fn acquire_watch_daemon_start_lock(
+    board: &std::path::Path,
+    persona: &str,
+) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    let path = watch_daemon_lock_path(board, persona);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening watch-daemon lock {}", path.display()))?;
+    // Block until we own it; a concurrent launcher waits here, then observes the
+    // daemon the winner started and takes the idempotent "already running" path.
+    file.lock_exclusive()
+        .with_context(|| format!("locking watch-daemon lock {}", path.display()))?;
+    Ok(file)
+}
+
+fn read_pid(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    // Non-destructive process probe. EPERM means "exists but not signalable".
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    false
+}
+
+fn pid_command(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+fn watch_daemon_running(board: &std::path::Path, persona: &str) -> Option<(u32, String)> {
+    let pid = read_pid(&watch_daemon_pid_path(board, persona))?;
+    if !pid_is_alive(pid) {
+        return None;
+    }
+    let cmd = pid_command(pid).unwrap_or_default();
+    if cmd.contains("watch-daemon") && cmd.contains("--foreground") {
+        Some((pid, cmd))
+    } else {
+        None
+    }
+}
+
+fn watch_daemon_argv(
+    spriff_bin: &str,
+    name: &str,
+    persona: &str,
+    config: Option<&std::path::Path>,
+    restart_delay: u64,
+) -> Vec<String> {
+    let mut argv = vec![
+        spriff_bin.to_string(),
+        "watch-daemon".to_string(),
+        "--collab".to_string(),
+        name.to_string(),
+        "--as".to_string(),
+        persona.to_string(),
+        "--restart-delay".to_string(),
+        restart_delay.to_string(),
+        "--foreground".to_string(),
+    ];
+    if let Some(c) = config {
+        argv.push("--config".to_string());
+        argv.push(c.display().to_string());
+    }
+    argv
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_watch_daemon(
+    cfg: &Config,
+    name: &str,
+    persona: &str,
+    status: bool,
+    stop: bool,
+    foreground: bool,
+    restart_delay: u64,
+    config: Option<PathBuf>,
+) -> Result<()> {
+    if !cfg
+        .agents
+        .iter()
+        .any(|a| a.persona.eq_ignore_ascii_case(persona))
+    {
+        let roster: Vec<&str> = cfg.agents.iter().map(|a| a.persona.as_str()).collect();
+        anyhow::bail!(
+            "persona '{persona}' is not on '{name}' roster [{}]. Use --as <one of them>.",
+            roster.join(", ")
+        );
+    }
+
+    let board = cfg.board_path();
+    let pidfile = watch_daemon_pid_path(&board, persona);
+    let log = watch_daemon_log_path(&board, persona);
+
+    if foreground {
+        if let Some(parent) = pidfile.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Some(parent) = log.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&pidfile, std::process::id().to_string())
+            .with_context(|| format!("writing {}", pidfile.display()))?;
+        eprintln!(
+            "[spriff] watch-daemon foreground running as {persona} on '{name}' (pid {}, log {})",
+            std::process::id(),
+            log.display()
+        );
+        loop {
+            match watcher::run(cfg, persona) {
+                Ok(()) => {
+                    eprintln!("[spriff] inner watch exited cleanly; restarting in {restart_delay}s")
+                }
+                Err(e) => {
+                    eprintln!("[spriff] inner watch failed: {e:#}; restarting in {restart_delay}s")
+                }
+            }
+            // Floor the restart cadence at 1s. `watcher::run` normally BLOCKS
+            // forever, so we only reach here on an exit/error; if it were to fail
+            // instantly and persistently (e.g. a broken notify backend), an
+            // unfloored `--restart-delay 0` would busy-spin at 100% CPU and flood
+            // the log. The floor costs nothing in the normal (rare-restart) case.
+            std::thread::sleep(Duration::from_secs(restart_delay.max(1)));
+        }
+    }
+
+    if status {
+        match watch_daemon_running(&board, persona) {
+            Some((pid, cmd)) => {
+                println!("watch-daemon: running");
+                println!("  pid:  {pid}");
+                println!("  cmd:  {cmd}");
+                println!("  log:  {}", log.display());
+            }
+            None => {
+                println!("watch-daemon: not running");
+                if pidfile.exists() {
+                    println!("  stale pidfile: {}", pidfile.display());
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if stop {
+        let Some((pid, _cmd)) = watch_daemon_running(&board, persona) else {
+            println!("watch-daemon: not running");
+            std::fs::remove_file(&pidfile).ok();
+            return Ok(());
+        };
+        #[cfg(unix)]
+        {
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        }
+        for _ in 0..40 {
+            if !pid_is_alive(pid) {
+                std::fs::remove_file(&pidfile).ok();
+                println!("watch-daemon: stopped pid {pid}");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!(
+            "watch-daemon: sent SIGTERM to pid {pid}, but it still appears alive; pidfile retained"
+        );
+        return Ok(());
+    }
+
+    // Hold the start lock across the WHOLE check→spawn→pidfile→verify window so
+    // concurrent launches can't each spawn a worker (see acquire_watch_daemon_start_lock).
+    // Released when `_start_lock` drops at function return; the spawned worker does
+    // not inherit or hold it.
+    let _start_lock = acquire_watch_daemon_start_lock(&board, persona)?;
+
+    if let Some((pid, _cmd)) = watch_daemon_running(&board, persona) {
+        println!("watch-daemon: already running (pid {pid})");
+        println!("  log: {}", log.display());
+        return Ok(());
+    }
+
+    if pidfile.exists() {
+        // Stale pidfile; ownership is by liveness probe, never by path existence.
+        std::fs::remove_file(&pidfile).ok();
+    }
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let spriff_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "spriff".to_string());
+    let argv = watch_daemon_argv(&spriff_bin, name, persona, config.as_deref(), restart_delay);
+
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .with_context(|| format!("opening {}", log.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("cloning {}", log.display()))?;
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .current_dir(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr));
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        // New session => not tied to the caller's controlling terminal/shell.
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().context("starting watch-daemon worker")?;
+    let pid = child.id();
+    std::fs::write(&pidfile, pid.to_string())
+        .with_context(|| format!("writing {}", pidfile.display()))?;
+    // Verify the worker survived startup before claiming success. A child that dies
+    // instantly (e.g. an unresolved collab/config in the detached process) would
+    // otherwise leave us printing "started" over a stale pidfile that `--status`
+    // later reports as dead. We're still under `_start_lock`, so a concurrent
+    // launcher can't observe this half-built state.
+    std::thread::sleep(Duration::from_millis(150));
+    if !pid_is_alive(pid) {
+        std::fs::remove_file(&pidfile).ok();
+        anyhow::bail!(
+            "watch-daemon worker (pid {pid}) exited immediately during startup; \
+             see the log for why: {}",
+            log.display()
+        );
+    }
+    println!("watch-daemon: started pid {pid}");
+    println!("  log: {}", log.display());
+    println!("  status: spriff watch-daemon --collab {name} --as {persona} --status");
+    println!("  stop:   spriff watch-daemon --collab {name} --as {persona} --stop");
+    Ok(())
+}
+
 /// Resolve (config, name) from optional flags, honouring the registry priority
 /// order. An explicit `--config <path>` short-circuits name resolution.
 fn resolve(collab: Option<String>, config: Option<PathBuf>) -> Result<(Config, String)> {
@@ -1447,13 +1846,15 @@ fn cmd_join(
         println!(
             "\n═══════════ STEP 0 — DECIDE WHO ACTS AS {me} (ask the operator FIRST) ═══════════"
         );
-        println!(
-            "Before backgrounding anything, settle ONE question. If a HUMAN is in a live chat"
-        );
-        println!("with you right now, ASK them — do not assume. This is the #1 setup mistake:");
+        println!("DEFAULT: if a HUMAN is in a live chat with you right now and asked YOU to");
+        println!("be the reviewer/implementer, THIS SESSION is {me}. Do not background a");
+        println!("different agent unless the operator explicitly asks for autonomous mode.");
+        println!("Only ask if the prompt is ambiguous. This was the #1 setup mistake:");
         println!("an agent asked in a chat to \"set up spriff and review\" silently backgrounds a");
         println!("SEPARATE agent, and the human loses the live session they wanted to steer.\n");
-        println!("  (A) THIS session is {me} — interactive / operator-steered.");
+        println!(
+            "  (A) DEFAULT for live chats: THIS session is {me} — visible / operator-steered."
+        );
         println!(
             "      The agent the operator is already chatting with IS the persona. You run the"
         );
@@ -1462,15 +1863,24 @@ fn cmd_join(
             "      The operator sees every turn and can interrupt to steer. In mode (A) do NOT"
         );
         println!("      run `spriff supervise`/`serve` — that spawns a DIFFERENT agent, not you.");
+        println!(
+            "      Optional safety net: `spriff watch-daemon --as {me}` keeps sidecar signals"
+        );
+        println!("      fresh, but YOU still drain inbox and do the reviewing in this chat.");
         println!("  (B) A SEPARATE supervised process — hands-off / autonomous.");
         println!(
             "      A fresh headless agent spriff re-invokes once per peer turn, independent of"
         );
         println!("      this chat. The operator then reviews via the board, not this chat:");
         println!("        ▶ PERSISTENT (restarts on crash, starts on boot):");
-        println!("              spriff supervise --as {me} --install -- <your-agent-cmd>");
+        println!(
+            "              spriff supervise --as {me} --autonomous --install -- <your-agent-cmd>"
+        );
         println!("        ▶ FOREGROUND (one session you can watch):");
-        println!("              spriff serve --as {me} -- <your-agent-cmd>");
+        println!("              spriff serve --as {me} --autonomous -- <your-agent-cmd>");
+        println!("        (Both REQUIRE --autonomous — the explicit opt-in to spawn a SEPARATE");
+        println!("         agent. Without it they refuse and tell you to use the (A) wait-loop,");
+        println!("         so an in-chat reviewer is never backgrounded by accident.)");
         println!(
             "          (<your-agent-cmd> is a headless agent, e.g. `claude -p` or `codex exec`.)"
         );
@@ -1900,9 +2310,23 @@ fn cmd_serve(
     idle_timeout: u64,
     poll: u64,
     kickoff: bool,
+    autonomous: bool,
     agent_cmd: &[String],
     config: Option<PathBuf>,
 ) -> Result<()> {
+    // VISIBLE-BY-DEFAULT GUARD (SPAWN-OPT-IN-01): `serve` spawns a SEPARATE,
+    // headless agent process — NOT the live chat/session the operator is in. That
+    // is exactly how an agent asked in chat to "set up spriff and review" silently
+    // backgrounds a second agent the human can't see or steer. So spawning a
+    // separate agent is now an EXPLICIT opt-in: refuse unless `--autonomous` was
+    // passed. The supervisor (`supervise`) always passes it through to the service
+    // it installs, so genuine autonomous mode is unaffected; only a bare
+    // interactive `serve` with no opt-in is refused, with the in-session loop named.
+    if !autonomous {
+        anyhow::bail!(
+            "`spriff serve` starts a SEPARATE headless agent (a new process), not the live \nchat/session you are in.\n\nIf a human asked YOU (this session) to be {persona}, do NOT serve \u{2014} run the \nin-session loop instead, so the reviewing stays VISIBLE in this chat:\n    spriff wait --as {persona}\n\nOnly if you deliberately want a separate, hands-off autonomous agent, re-run with \nthe explicit opt-in:\n    spriff serve --as {persona} --autonomous -- <your-agent-cmd>"
+        );
+    }
     // Identity validation at the persistent entry point: refuse to supervise an
     // off-roster persona (it would act as someone the collaboration doesn't know).
     if !cfg
@@ -2501,6 +2925,10 @@ fn serve_argv(
         name.to_string(),
         "--as".to_string(),
         persona.to_string(),
+        // The supervised service IS the operator-blessed autonomous agent, so it
+        // carries the explicit spawn opt-in (SPAWN-OPT-IN-01). Without this the
+        // service's own `serve` invocation would refuse to start.
+        "--autonomous".to_string(),
     ];
     if let Some(c) = config {
         argv.push("--config".to_string());
@@ -2522,9 +2950,20 @@ fn cmd_supervise(
     persona: &str,
     label: Option<String>,
     install: bool,
+    autonomous: bool,
     agent_cmd: &[String],
     config: Option<PathBuf>,
 ) -> Result<()> {
+    // VISIBLE-BY-DEFAULT GUARD (SPAWN-OPT-IN-01): `supervise` installs an OS
+    // service that runs a SEPARATE headless agent forever — the strongest form of
+    // "background a second agent". Require the same explicit opt-in as `serve` so
+    // an agent in a live chat cannot silently subscribe a hidden duplicate of
+    // itself. The in-session reviewer path is `spriff wait`, named in the refusal.
+    if !autonomous {
+        anyhow::bail!(
+            "`spriff supervise` installs a SEPARATE headless agent as an always-on OS \nservice \u{2014} it does NOT make the live chat/session you are in become {persona}.\n\nIf a human asked YOU (this session) to be {persona}, do NOT supervise \u{2014} run the \nin-session loop instead, so the work stays VISIBLE in this chat:\n    spriff wait --as {persona}\n\nOnly if you deliberately want a separate, hands-off autonomous agent installed as a \nservice, re-run with the explicit opt-in:\n    spriff supervise --as {persona} --autonomous --install -- <your-agent-cmd>"
+        );
+    }
     // Same identity guard as serve: never supervise an off-roster persona.
     if !cfg
         .agents
@@ -2764,6 +3203,14 @@ fn cmd_status(cfg: &Config, name: &str, persona: &str) -> Result<()> {
             "no — expected for an interactive `spriff wait` loop; for a separate autonomous agent use `spriff supervise --as <you> -- <agent-cmd>`"
         }
     );
+    match watch_daemon_running(&board_path, persona) {
+        Some((pid, _cmd)) => println!(
+            "  watch-daemon: yes — native sidecar watcher daemon running (pid {pid})"
+        ),
+        None => println!(
+            "  watch-daemon: no — run `spriff watch-daemon --as {persona}` for durable sidecar signals"
+        ),
+    }
     // Inactivity watchdog.
     let stall_idle = cfg.stall_idle_secs();
     if stall_idle > 0 {
@@ -3195,6 +3642,56 @@ mod tests {
     }
 
     #[test]
+    fn watch_daemon_paths_are_per_persona() {
+        assert_eq!(
+            watch_daemon_pid_path(Path::new("/x/foo.board.md"), "Alice"),
+            PathBuf::from("/x/foo.alice.watch-daemon.pid")
+        );
+        assert_eq!(
+            watch_daemon_log_path(Path::new("/x/foo.board.md"), "Alice"),
+            PathBuf::from("/x/foo.alice.watch-daemon.log")
+        );
+        assert_eq!(
+            watch_daemon_lock_path(Path::new("/x/foo.board.md"), "Alice"),
+            PathBuf::from("/x/foo.alice.watch-daemon.lock")
+        );
+    }
+
+    // The start lock is what serializes concurrent `watch-daemon` launches so only
+    // ONE detached worker is ever spawned per persona — without it, simultaneous
+    // launches each spawn a worker and orphan all but the last (which `--stop`
+    // can't reap). Prove the flock is genuinely exclusive while held and frees on drop.
+    #[test]
+    fn watch_daemon_start_lock_is_exclusive_then_releasable() {
+        use fs2::FileExt;
+        let dir = std::env::temp_dir().join(format!("spriff-wdlock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let board = dir.join("t.board.md");
+        std::fs::write(&board, "x").unwrap();
+
+        let held = acquire_watch_daemon_start_lock(&board, "Alice").unwrap();
+        // A separate handle on the SAME lock inode must not be grabbable while held.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(watch_daemon_lock_path(&board, "Alice"))
+            .unwrap();
+        assert!(
+            probe.try_lock_exclusive().is_err(),
+            "watch-daemon start lock must be exclusive while held"
+        );
+        drop(held); // releases the OS lock
+        assert!(
+            probe.try_lock_exclusive().is_ok(),
+            "lock must be re-acquirable once the holder drops"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn serve_lock_is_exclusive_then_releasable() {
         let dir = std::env::temp_dir().join(format!("spriff-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3413,15 +3910,39 @@ mod tests {
             Some(std::path::Path::new("/x/demo.toml")),
             &["codex".to_string(), "exec".to_string()],
         );
-        // The wrapped command is `spriff serve --collab demo --as Alice --config … -- codex exec`.
+        // The wrapped command is `spriff serve --collab demo --as Alice --autonomous --config … -- codex exec`.
         assert_eq!(argv[0], "/usr/local/bin/spriff");
         assert_eq!(argv[1], "serve");
         assert!(argv.windows(2).any(|w| w == ["--collab", "demo"]));
         assert!(argv.windows(2).any(|w| w == ["--as", "Alice"]));
         assert!(argv.contains(&"--config".to_string()));
-        // Everything after the `--` separator is the agent command, in order.
+        // SPAWN-OPT-IN-01: the supervised service must carry the explicit autonomous
+        // opt-in, BEFORE the `--` separator, or its own `serve` would refuse to start.
         let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert!(
+            argv[..sep].contains(&"--autonomous".to_string()),
+            "supervised serve argv must include --autonomous before the `--` separator"
+        );
+        // Everything after the `--` separator is the agent command, in order.
         assert_eq!(&argv[sep + 1..], &["codex".to_string(), "exec".to_string()]);
+    }
+
+    #[test]
+    fn watch_daemon_argv_wraps_foreground_worker() {
+        let argv = watch_daemon_argv(
+            "/usr/local/bin/spriff",
+            "demo",
+            "Alice",
+            Some(std::path::Path::new("/x/demo.toml")),
+            7,
+        );
+        assert_eq!(argv[0], "/usr/local/bin/spriff");
+        assert_eq!(argv[1], "watch-daemon");
+        assert!(argv.windows(2).any(|w| w == ["--collab", "demo"]));
+        assert!(argv.windows(2).any(|w| w == ["--as", "Alice"]));
+        assert!(argv.windows(2).any(|w| w == ["--restart-delay", "7"]));
+        assert!(argv.contains(&"--foreground".to_string()));
+        assert!(argv.windows(2).any(|w| w == ["--config", "/x/demo.toml"]));
     }
 
     #[test]
@@ -3473,5 +3994,70 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("WorkingDirectory=/work"));
         assert!(unit.contains("Environment=SPRIFF_HOME=/custom/home"));
+    }
+
+    // ── SPAWN-OPT-IN-01: serve/supervise refuse to spawn a separate agent
+    //    without the explicit --autonomous opt-in, and the supervised service
+    //    carries that opt-in so genuine autonomous mode still starts. ──────────
+
+    #[test]
+    fn cmd_serve_refuses_without_autonomous_opt_in() {
+        let cfg: Config = toml::from_str(
+            "board = \"/x/b.md\"\n\
+             [[agents]]\npersona = \"Abbey\"\nrole = \"executor\"\n\
+             [[agents]]\npersona = \"Alice\"\nrole = \"reviewer\"\n",
+        )
+        .unwrap();
+        let err = cmd_serve(
+            &cfg,
+            "demo",
+            "Alice",
+            0,
+            2,
+            true,
+            false, // autonomous = NOT opted in
+            &["codex".to_string(), "exec".to_string()],
+            None,
+        )
+        .expect_err("serve must refuse to spawn a separate agent without --autonomous");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("spriff wait --as Alice"),
+            "must name the in-session loop: {msg}"
+        );
+        assert!(
+            msg.contains("--autonomous"),
+            "must name the explicit opt-in: {msg}"
+        );
+    }
+
+    #[test]
+    fn cmd_supervise_refuses_without_autonomous_opt_in() {
+        let cfg: Config = toml::from_str(
+            "board = \"/x/b.md\"\n\
+             [[agents]]\npersona = \"Abbey\"\nrole = \"executor\"\n\
+             [[agents]]\npersona = \"Alice\"\nrole = \"reviewer\"\n",
+        )
+        .unwrap();
+        let err = cmd_supervise(
+            &cfg,
+            "demo",
+            "Alice",
+            None,
+            false, // install
+            false, // autonomous = NOT opted in
+            &["codex".to_string(), "exec".to_string()],
+            None,
+        )
+        .expect_err("supervise must refuse without --autonomous");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("spriff wait --as Alice"),
+            "must name the in-session loop: {msg}"
+        );
+        assert!(
+            msg.contains("--autonomous"),
+            "must name the explicit opt-in: {msg}"
+        );
     }
 }

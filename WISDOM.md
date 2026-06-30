@@ -59,5 +59,65 @@ Wrong root-cause diagnoses come from reasoning off commit titles and stale local
 | §5 | Lean Beats Clever | Foundational Principles |
 | §6 | Reproduce Before You Theorize | Foundational Principles |
 | §7 | The Repo Contract Overrides Tool Defaults | Foundational Principles |
+| §8 | Current-Session Wakeups Require Foreground Wait | Foundational Principles |
+| §9 | Sidecar Watchers Need a Native Daemon, Not Ad-Hoc Shell | Foundational Principles |
+| §10 | Live Reviewer Requests Mean the Visible Session by Default | Foundational Principles |
 
 > Add new entries below with the next free `§N` and register them above.
+
+### §8. Current-Session Wakeups Require Foreground Wait
+Trigger: an operator expected the reviewer agent in an already-open chat to be
+notified by spriff, while the setup drifted through background `watch`/detached
+`wait`/supervised-child variants that did not re-enter that same chat.
+
+Decision/pattern: treat "THIS session is the persona" as a foreground loop, not a
+subscription flag. The live agent must run `spriff wait --as <persona> --timeout
+600 --interval 2`, handle what prints, post, ack, and immediately re-arm. A
+timeout is only a heartbeat. `spriff watch` and `spriff supervise` are valid for
+sidecar/supervised workflows, but they do not resume a stopped chat model.
+
+Evidence: `SKILL.md`, `docs/OPERATING.md`, and `README.md` now all make the same
+foreground-vs-autonomous distinction and warn that `subscribed: no` is expected in
+interactive mode.
+
+Expected effect: agents stop claiming they are "watching" because a background
+process exists, and operators can choose deliberately between a steerable
+current-session reviewer and an autonomous separate child process.
+
+### §9. Sidecar Watchers Need a Native Daemon, Not Ad-Hoc Shell
+Trigger: an operator repeatedly asked a live reviewer to "keep watching" a Spriff
+board while the foreground `wait` process was tied to one chat/tool turn and
+ad-hoc `nohup`/shell loops drifted across machines (`setsid` exists on Linux, not
+macOS) or died without a clear status surface.
+
+Decision/pattern: Spriff owns the durable sidecar-watch primitive. Use
+`spriff watch-daemon` when the need is "keep board/file signals fresh across chat
+turn boundaries, but do not spawn a separate child agent." It is idempotent,
+detached, self-restarts the underlying event-driven `watch`, writes pid/log
+sidecars, and is visible in `spriff status`.
+
+Evidence: `src/main.rs` implements `watch-daemon` with `--status`/`--stop` and a
+restart loop; `tests/rendezvous.rs::watch_daemon_start_status_idempotent_signal_and_stop`
+drives it end-to-end against an isolated `SPRIFF_HOME`.
+
+Expected effect: agents stop hand-rolling brittle watcher scripts, operators can
+verify the native watcher with one command, and "watching" means a durable Spriff
+sidecar is actually alive instead of an invisible shell artifact.
+
+### §10. Live Reviewer Requests Mean the Visible Session by Default
+Trigger: an operator asked an already-open agent to be a Spriff reviewer and
+expected to see that same agent's review activity in the chat, while the workflow
+kept drifting toward hidden supervisors or sidecar-only watchers.
+
+Decision/pattern: make current-session ownership the default when a human asks a
+live chat agent to be reviewer/implementer. `spriff watch-daemon` can keep durable
+sidecar signals alive, but it is not the reviewer; `spriff supervise`/`serve`
+create a separate autonomous agent and require explicit opt-in.
+
+Evidence: `SKILL.md`, `README.md`, `docs/OPERATING.md`, and `cmd_join` output now
+state the default explicitly: visible live chat session first, autonomous
+supervisor only when requested.
+
+Expected effect: operators see the agent they asked doing the work; agents stop
+silently replacing themselves with a hidden child process; sidecar daemons are
+understood as notification durability, not identity ownership.
