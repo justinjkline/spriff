@@ -1033,7 +1033,12 @@ fn create_collab(name: &str, roster: &[String], board: Option<PathBuf>) -> Resul
 
     let mut toml = String::new();
     toml.push_str(&format!("# spriff collaboration: {name}\n"));
-    toml.push_str(&format!("board = \"{}\"\n\n", board_path.display()));
+    // Use a TOML literal string so Windows paths (with `\`) round-trip — see
+    // util::toml_string for the unicode-escape pitfall this avoids.
+    toml.push_str(&format!(
+        "board = {}\n\n",
+        util::toml_string(&board_path.display().to_string())
+    ));
     for (i, persona) in roster.iter().enumerate() {
         let role = if i == 0 { "executor" } else { "reviewer" };
         toml.push_str("[[agents]]\n");

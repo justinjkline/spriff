@@ -9,17 +9,38 @@
 
 use std::path::{Path, PathBuf};
 
-/// Expand a leading `~` to `$HOME`. Anything else is returned unchanged.
-/// Config files are written by humans, who expect `~` to work.
+/// The user's home directory. Prefers `$HOME` (set on Unix, and on Windows under
+/// Git Bash / MSYS), then falls back to `$USERPROFILE` — the *native* Windows home
+/// variable, since `HOME` is normally absent in cmd.exe and PowerShell. Without
+/// the fallback, spriff's default registry root (`$HOME/.spriff`) collapses to a
+/// cwd-relative `.spriff` on Windows, so two agents launched from different
+/// directories never rendezvous on the same board.
+pub fn home_dir() -> Option<String> {
+    resolve_home(
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
+    )
+}
+
+/// Pure core of [`home_dir`], split out so the precedence is unit-testable without
+/// mutating process-global environment variables.
+fn resolve_home(home: Option<&str>, userprofile: Option<&str>) -> Option<String> {
+    home.filter(|h| !h.is_empty())
+        .or_else(|| userprofile.filter(|h| !h.is_empty()))
+        .map(str::to_string)
+}
+
+/// Expand a leading `~` to the user's home dir. Anything else is returned
+/// unchanged. Config files are written by humans, who expect `~` to work.
 pub fn expand_tilde(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = home_dir() {
             return PathBuf::from(home).join(rest);
         }
     }
     if s == "~" {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = home_dir() {
             return PathBuf::from(home);
         }
     }
@@ -157,4 +178,32 @@ pub fn add_watchpath(file: &Path, path: &Path) -> std::io::Result<bool> {
         .open(file)?;
     writeln!(f, "{}", canonical.display())?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_home_prefers_home_then_userprofile() {
+        // HOME wins when present (Unix, Git Bash on Windows).
+        assert_eq!(
+            resolve_home(Some("/home/abbey"), Some(r"C:\Users\abbey")).as_deref(),
+            Some("/home/abbey")
+        );
+        // The Windows case that bit us: HOME unset -> fall back to USERPROFILE so the
+        // registry root is absolute, not a cwd-relative `.spriff`.
+        assert_eq!(
+            resolve_home(None, Some(r"C:\Users\abbey")).as_deref(),
+            Some(r"C:\Users\abbey")
+        );
+        // An empty HOME must not shadow a real USERPROFILE.
+        assert_eq!(
+            resolve_home(Some(""), Some(r"C:\Users\abbey")).as_deref(),
+            Some(r"C:\Users\abbey")
+        );
+        // Nothing set -> None, so the caller applies its own last-resort default.
+        assert_eq!(resolve_home(None, None), None);
+        assert_eq!(resolve_home(Some(""), Some("")), None);
+    }
 }

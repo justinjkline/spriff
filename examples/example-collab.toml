@@ -6,6 +6,10 @@
 # executor lowest), but you can name them anything.
 
 board = "~/.spriff/checkout-refactor/checkout-refactor.board.md"
+# Windows note: write filesystem paths with backslashes as TOML *literal* strings
+# (single quotes) so `\` isn't read as an escape, e.g.
+#   board = 'C:\Users\you\.spriff\checkout-refactor\checkout-refactor.board.md'
+# `spriff` already does this for paths it writes; this only matters if you hand-edit.
 
 # Roster, ordered: index 0 is the executor, the rest are reviewers.
 [[agents]]

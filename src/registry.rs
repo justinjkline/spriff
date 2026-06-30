@@ -25,7 +25,10 @@ pub fn root() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    // Fall back to USERPROFILE on Windows (where HOME is usually unset); only then
+    // to "." — otherwise the registry root would silently become cwd-relative and
+    // two agents in different dirs would never share a board. See paths::home_dir.
+    let home = crate::paths::home_dir().unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".spriff")
 }
 
