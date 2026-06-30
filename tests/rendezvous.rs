@@ -834,6 +834,124 @@ fn supervise_prints_a_serve_wrapping_unit_without_installing() {
 }
 
 // ---------------------------------------------------------------------------
+// `spriff watch-daemon` is the native replacement for hand-rolled
+// `nohup spriff watch ... &` scripts. It must start detached, be idempotent, show
+// status, raise the normal pending signal, and stop cleanly so tests/users don't
+// leave orphan watchers behind.
+// ---------------------------------------------------------------------------
+#[test]
+fn watch_daemon_start_status_idempotent_signal_and_stop() {
+    let sb = Sandbox::new("watch-daemon");
+    let cwd = sb.cwd("op");
+    let o = sb.run(&cwd, &["init", "watchd", "--agents", "2", "--letter", "a"]);
+    assert!(o.status.success(), "init failed: {}", stderr(&o));
+
+    let start = sb.run(
+        &cwd,
+        &[
+            "watch-daemon",
+            "--collab",
+            "watchd",
+            "--as",
+            "Alice",
+            "--restart-delay",
+            "1",
+        ],
+    );
+    assert!(start.status.success(), "start failed: {}", stderr(&start));
+    assert!(
+        stdout(&start).contains("watch-daemon: started"),
+        "start output should say it started:\n{}",
+        stdout(&start)
+    );
+
+    let running = (0..40).any(|_| {
+        let s = sb.run(
+            &cwd,
+            &[
+                "watch-daemon",
+                "--collab",
+                "watchd",
+                "--as",
+                "Alice",
+                "--status",
+            ],
+        );
+        if stdout(&s).contains("watch-daemon: running") {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(running, "watch-daemon never reported running");
+
+    let again = sb.run(
+        &cwd,
+        &["watch-daemon", "--collab", "watchd", "--as", "Alice"],
+    );
+    assert!(
+        again.status.success(),
+        "second start failed: {}",
+        stderr(&again)
+    );
+    assert!(
+        stdout(&again).contains("already running"),
+        "second start must be idempotent:\n{}",
+        stdout(&again)
+    );
+
+    let post = sb.run_stdin(
+        &cwd,
+        &[
+            "post",
+            "--collab",
+            "watchd",
+            "--as",
+            "Abbey",
+            "-s",
+            "please review",
+            "--status",
+            "NEEDS-REVIEW",
+        ],
+        "body",
+    );
+    assert!(post.status.success(), "post failed: {}", stderr(&post));
+    let flag = sb.root.join("watchd").join("watchd.alice.pending.flag");
+    let raised = (0..80).any(|_| {
+        if flag.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(
+        raised,
+        "daemon did not raise pending flag at {}",
+        flag.display()
+    );
+
+    let stop = sb.run(
+        &cwd,
+        &[
+            "watch-daemon",
+            "--collab",
+            "watchd",
+            "--as",
+            "Alice",
+            "--stop",
+        ],
+    );
+    assert!(stop.status.success(), "stop failed: {}", stderr(&stop));
+    assert!(
+        stdout(&stop).contains("stopped") || stdout(&stop).contains("sent SIGTERM"),
+        "stop should report a stop attempt:\n{}",
+        stdout(&stop)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 15. The foreground/operator-steered `wait` loop must not silently race a
 //     separate supervised child for the same persona. This was the confusing
 //     "which Punchyman is actually watching?" failure mode: if `serve` is already

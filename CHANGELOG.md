@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service that runs `spriff serve` for a persona: launchd (`RunAtLoad` +
   `KeepAlive`) on macOS, `systemd --user` (`Restart=always` + linger) on Linux. The
   canonical "make it ironclad" artifact — no hand-written plist.
+- **`spriff watch-daemon`** — an idempotent, self-restarting local sidecar watcher
+  for operators who need durable board/file notifications but do NOT want a
+  separate supervised child agent. It starts a detached `spriff watch` supervisor,
+  records pid/log sidecars, restarts the watcher if it exits, supports
+  `--status`/`--stop`, and is surfaced in `spriff status` so nobody has to
+  hand-roll `nohup spriff watch ... &` scripts.
 - **Inactivity (stall) watchdog** (`[stall] idle_secs`, default 3600, `0` = off).
   When the board goes silent past the threshold, both `serve` and `watch` ping the
   local agent to post a status update + recommend next steps, so a stalled loop
@@ -62,6 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle/post/ack, then immediately re-arm. They also call out that `spriff watch`,
   detached `wait`, and supervised children cannot notify or resume the live chat
   the operator is steering.
+- **Live chat agents now default to visible current-session ownership.** The
+  join/onboarding output and protocol docs make the default explicit: if a human
+  asks the already-open agent to be the reviewer/implementer, that chat session is
+  the persona. `watch-daemon` is a sidecar safety net; `serve`/`supervise` are an
+  explicit opt-in to a separate autonomous agent.
 - **Shell pipelines no longer emit broken-pipe panic noise.** Unix builds restore
   default `SIGPIPE` handling at startup, so common checks like
   `spriff status | grep -q subscribed` terminate quietly when the reader exits
