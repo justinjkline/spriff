@@ -255,11 +255,11 @@ anyone backgrounds work:
 ```sh
 # Subscribe persistently — generates + installs an OS service (launchd/systemd)
 # that runs `spriff serve` for a SEPARATE child agent, restarts it on crash, and starts it on boot:
-spriff supervise --as Pamela --install -- claude -p     # implementer, driven by Claude
-spriff supervise --as Peter  --install -- codex exec    # reviewer, driven by Codex
+spriff supervise --as Pamela --autonomous --install -- claude -p   # implementer, driven by Claude
+spriff supervise --as Peter  --autonomous --install -- codex exec  # reviewer, driven by Codex
 
 # …or run a foreground supervisor you can watch in a terminal (still a separate child agent):
-spriff serve --as Pamela -- claude -p
+spriff serve --as Pamela --autonomous -- claude -p
 ```
 
 `spriff status --as <you>` shows `subscribed: yes` once a separate supervisor is
@@ -300,8 +300,8 @@ Bring your own cast: `spriff join --role implementer --as Pamela --with Peter`
 | `spriff init <name> [--agents N] [--letter X] [--persona …]` | Create + register a collaboration explicitly. |
 | `spriff list` | List registered collaborations and rosters. |
 | `spriff skill` | Print the agent protocol (onboard any CLI agent). |
-| `spriff supervise [--as P] [--install] -- <agent-cmd>` | **Autonomous separate agent.** Generate (and with `--install` load) an OS service that runs `spriff serve` — restarts on crash, starts on boot. No hand-rolled plist. |
-| `spriff serve [--as P] -- <agent-cmd>` | **Foreground supervisor for a separate child.** Re-invoke `<agent-cmd>` for one turn on every peer post, surviving child stop/crash/timeout. |
+| `spriff supervise [--as P] --autonomous [--install] -- <agent-cmd>` | **Autonomous separate agent.** Generate (and with `--install` load) an OS service that runs `spriff serve` — restarts on crash, starts on boot. No hand-rolled plist. **Requires `--autonomous`** — without it spriff refuses and points you to the in-session `spriff wait` loop. |
+| `spriff serve [--as P] --autonomous -- <agent-cmd>` | **Foreground supervisor for a separate child.** Re-invoke `<agent-cmd>` for one turn on every peer post, surviving child stop/crash/timeout. **Requires `--autonomous`.** |
 | `spriff watch [--as P]` | Run the event-driven watcher (proactive wakeups + stall/early-review nudges) for sidecar/supervised workflows; not a replacement for the foreground `wait` loop in a live chat. |
 | `spriff inbox [--as P]` | Show the peer delta since your cursor. |
 | `spriff wait [--as P]` | Interactive/current-session primitive: block until a peer posts, then print their turn. Keep it foregrounded/re-armed in the same chat session. Refuses if a separate `serve` already owns that persona. |

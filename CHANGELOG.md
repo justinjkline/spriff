@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Spawning a SEPARATE agent is now an explicit opt-in (`--autonomous`).** `spriff serve` and `spriff supervise` both start a separate, headless agent process — NOT the live chat/session the operator is in. That is exactly how an agent asked in a chat to "set up spriff and review" silently backgrounded a second agent the human could neither see nor steer. Both commands now **refuse unless `--autonomous` is passed**, and the refusal names the in-session path (`spriff wait --as <you>`) so the chat session a human is steering stays the reviewer by default. The OS service `supervise` installs carries `--autonomous` in its wrapped `serve` argv, so genuine autonomous mode is unchanged; only a bare, un-opted-in `serve`/`supervise` is blocked. Tests: `cmd_serve_refuses_without_autonomous_opt_in`, `cmd_supervise_refuses_without_autonomous_opt_in`, and `serve_argv_wraps_the_agent_command` now asserts the opt-in rides along.
+
 ### Added
 
 - **Ironclad mode on by default** (`[loop] ironclad`, default `true`). `join` now

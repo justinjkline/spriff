@@ -182,6 +182,14 @@ enum Cmd {
         /// future peer turns.
         #[arg(long)]
         no_kickoff: bool,
+        /// Spawn a SEPARATE, headless autonomous agent (a NEW process that is NOT
+        /// the live chat/session you are in). REQUIRED to start one: without it
+        /// `serve` refuses and points you at the in-session `spriff wait` loop, so
+        /// the session a human is steering stays the agent. This is the guard that
+        /// stops an agent asked in chat to "review" from silently backgrounding a
+        /// second agent the operator can't see.
+        #[arg(long)]
+        autonomous: bool,
         /// The agent command to run per turn (everything after `--`). spriff
         /// appends a wake prompt as the final argument. e.g. `-- claude -p`.
         #[arg(last = true, required = true)]
@@ -208,6 +216,13 @@ enum Cmd {
         /// unit is only printed for you to review/install yourself).
         #[arg(long)]
         install: bool,
+        /// Install a SEPARATE, headless autonomous agent as an OS service (NOT the
+        /// live chat/session you are in). REQUIRED: without it `supervise` refuses
+        /// and points you at `spriff wait` for in-session review. The generated
+        /// service always runs in autonomous mode, so this flag is the operator's
+        /// explicit "yes, background a second agent" confirmation.
+        #[arg(long)]
+        autonomous: bool,
         /// The agent command to supervise (everything after `--`), exactly as for
         /// `serve`. e.g. `-- claude -p`.
         #[arg(last = true, required = true)]
@@ -438,6 +453,7 @@ fn main() -> Result<()> {
             idle_timeout,
             poll,
             no_kickoff,
+            autonomous,
             agent_cmd,
         } => {
             let (cfg, name) = resolve(collab, config.clone())?;
@@ -449,6 +465,7 @@ fn main() -> Result<()> {
                 idle_timeout,
                 poll,
                 !no_kickoff,
+                autonomous,
                 &agent_cmd,
                 config,
             )
@@ -459,11 +476,14 @@ fn main() -> Result<()> {
             as_persona,
             label,
             install,
+            autonomous,
             agent_cmd,
         } => {
             let (cfg, name) = resolve(collab, config.clone())?;
             let persona = resolve_persona(as_persona, &cfg);
-            cmd_supervise(&cfg, &name, &persona, label, install, &agent_cmd, config)
+            cmd_supervise(
+                &cfg, &name, &persona, label, install, autonomous, &agent_cmd, config,
+            )
         }
         Cmd::Post {
             collab,
@@ -1463,9 +1483,14 @@ fn cmd_join(
         );
         println!("      this chat. The operator then reviews via the board, not this chat:");
         println!("        ▶ PERSISTENT (restarts on crash, starts on boot):");
-        println!("              spriff supervise --as {me} --install -- <your-agent-cmd>");
+        println!(
+            "              spriff supervise --as {me} --autonomous --install -- <your-agent-cmd>"
+        );
         println!("        ▶ FOREGROUND (one session you can watch):");
-        println!("              spriff serve --as {me} -- <your-agent-cmd>");
+        println!("              spriff serve --as {me} --autonomous -- <your-agent-cmd>");
+        println!("        (Both REQUIRE --autonomous — the explicit opt-in to spawn a SEPARATE");
+        println!("         agent. Without it they refuse and tell you to use the (A) wait-loop,");
+        println!("         so an in-chat reviewer is never backgrounded by accident.)");
         println!(
             "          (<your-agent-cmd> is a headless agent, e.g. `claude -p` or `codex exec`.)"
         );
@@ -1895,9 +1920,23 @@ fn cmd_serve(
     idle_timeout: u64,
     poll: u64,
     kickoff: bool,
+    autonomous: bool,
     agent_cmd: &[String],
     config: Option<PathBuf>,
 ) -> Result<()> {
+    // VISIBLE-BY-DEFAULT GUARD (SPAWN-OPT-IN-01): `serve` spawns a SEPARATE,
+    // headless agent process — NOT the live chat/session the operator is in. That
+    // is exactly how an agent asked in chat to "set up spriff and review" silently
+    // backgrounds a second agent the human can't see or steer. So spawning a
+    // separate agent is now an EXPLICIT opt-in: refuse unless `--autonomous` was
+    // passed. The supervisor (`supervise`) always passes it through to the service
+    // it installs, so genuine autonomous mode is unaffected; only a bare
+    // interactive `serve` with no opt-in is refused, with the in-session loop named.
+    if !autonomous {
+        anyhow::bail!(
+            "`spriff serve` starts a SEPARATE headless agent (a new process), not the live \nchat/session you are in.\n\nIf a human asked YOU (this session) to be {persona}, do NOT serve \u{2014} run the \nin-session loop instead, so the reviewing stays VISIBLE in this chat:\n    spriff wait --as {persona}\n\nOnly if you deliberately want a separate, hands-off autonomous agent, re-run with \nthe explicit opt-in:\n    spriff serve --as {persona} --autonomous -- <your-agent-cmd>"
+        );
+    }
     // Identity validation at the persistent entry point: refuse to supervise an
     // off-roster persona (it would act as someone the collaboration doesn't know).
     if !cfg
@@ -2496,6 +2535,10 @@ fn serve_argv(
         name.to_string(),
         "--as".to_string(),
         persona.to_string(),
+        // The supervised service IS the operator-blessed autonomous agent, so it
+        // carries the explicit spawn opt-in (SPAWN-OPT-IN-01). Without this the
+        // service's own `serve` invocation would refuse to start.
+        "--autonomous".to_string(),
     ];
     if let Some(c) = config {
         argv.push("--config".to_string());
@@ -2517,9 +2560,20 @@ fn cmd_supervise(
     persona: &str,
     label: Option<String>,
     install: bool,
+    autonomous: bool,
     agent_cmd: &[String],
     config: Option<PathBuf>,
 ) -> Result<()> {
+    // VISIBLE-BY-DEFAULT GUARD (SPAWN-OPT-IN-01): `supervise` installs an OS
+    // service that runs a SEPARATE headless agent forever — the strongest form of
+    // "background a second agent". Require the same explicit opt-in as `serve` so
+    // an agent in a live chat cannot silently subscribe a hidden duplicate of
+    // itself. The in-session reviewer path is `spriff wait`, named in the refusal.
+    if !autonomous {
+        anyhow::bail!(
+            "`spriff supervise` installs a SEPARATE headless agent as an always-on OS \nservice \u{2014} it does NOT make the live chat/session you are in become {persona}.\n\nIf a human asked YOU (this session) to be {persona}, do NOT supervise \u{2014} run the \nin-session loop instead, so the work stays VISIBLE in this chat:\n    spriff wait --as {persona}\n\nOnly if you deliberately want a separate, hands-off autonomous agent installed as a \nservice, re-run with the explicit opt-in:\n    spriff supervise --as {persona} --autonomous --install -- <your-agent-cmd>"
+        );
+    }
     // Same identity guard as serve: never supervise an off-roster persona.
     if !cfg
         .agents
@@ -3408,14 +3462,20 @@ mod tests {
             Some(std::path::Path::new("/x/demo.toml")),
             &["codex".to_string(), "exec".to_string()],
         );
-        // The wrapped command is `spriff serve --collab demo --as Alice --config … -- codex exec`.
+        // The wrapped command is `spriff serve --collab demo --as Alice --autonomous --config … -- codex exec`.
         assert_eq!(argv[0], "/usr/local/bin/spriff");
         assert_eq!(argv[1], "serve");
         assert!(argv.windows(2).any(|w| w == ["--collab", "demo"]));
         assert!(argv.windows(2).any(|w| w == ["--as", "Alice"]));
         assert!(argv.contains(&"--config".to_string()));
-        // Everything after the `--` separator is the agent command, in order.
+        // SPAWN-OPT-IN-01: the supervised service must carry the explicit autonomous
+        // opt-in, BEFORE the `--` separator, or its own `serve` would refuse to start.
         let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert!(
+            argv[..sep].contains(&"--autonomous".to_string()),
+            "supervised serve argv must include --autonomous before the `--` separator"
+        );
+        // Everything after the `--` separator is the agent command, in order.
         assert_eq!(&argv[sep + 1..], &["codex".to_string(), "exec".to_string()]);
     }
 
@@ -3468,5 +3528,70 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("WorkingDirectory=/work"));
         assert!(unit.contains("Environment=SPRIFF_HOME=/custom/home"));
+    }
+
+    // ── SPAWN-OPT-IN-01: serve/supervise refuse to spawn a separate agent
+    //    without the explicit --autonomous opt-in, and the supervised service
+    //    carries that opt-in so genuine autonomous mode still starts. ──────────
+
+    #[test]
+    fn cmd_serve_refuses_without_autonomous_opt_in() {
+        let cfg: Config = toml::from_str(
+            "board = \"/x/b.md\"\n\
+             [[agents]]\npersona = \"Abbey\"\nrole = \"executor\"\n\
+             [[agents]]\npersona = \"Alice\"\nrole = \"reviewer\"\n",
+        )
+        .unwrap();
+        let err = cmd_serve(
+            &cfg,
+            "demo",
+            "Alice",
+            0,
+            2,
+            true,
+            false, // autonomous = NOT opted in
+            &["codex".to_string(), "exec".to_string()],
+            None,
+        )
+        .expect_err("serve must refuse to spawn a separate agent without --autonomous");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("spriff wait --as Alice"),
+            "must name the in-session loop: {msg}"
+        );
+        assert!(
+            msg.contains("--autonomous"),
+            "must name the explicit opt-in: {msg}"
+        );
+    }
+
+    #[test]
+    fn cmd_supervise_refuses_without_autonomous_opt_in() {
+        let cfg: Config = toml::from_str(
+            "board = \"/x/b.md\"\n\
+             [[agents]]\npersona = \"Abbey\"\nrole = \"executor\"\n\
+             [[agents]]\npersona = \"Alice\"\nrole = \"reviewer\"\n",
+        )
+        .unwrap();
+        let err = cmd_supervise(
+            &cfg,
+            "demo",
+            "Alice",
+            None,
+            false, // install
+            false, // autonomous = NOT opted in
+            &["codex".to_string(), "exec".to_string()],
+            None,
+        )
+        .expect_err("supervise must refuse without --autonomous");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("spriff wait --as Alice"),
+            "must name the in-session loop: {msg}"
+        );
+        assert!(
+            msg.contains("--autonomous"),
+            "must name the explicit opt-in: {msg}"
+        );
     }
 }
