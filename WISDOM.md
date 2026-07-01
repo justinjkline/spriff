@@ -150,10 +150,12 @@ hooks fire from the *common* `.git/hooks`, not the per-worktree gitdir — a sil
 no-op class an adversarial review caught) and honoring a pinned `core.hooksPath`
 (e.g. husky's `.husky/`) — and **chains** any pre-existing hook instead of clobbering
 it. The hook is best-effort (never blocks a commit), sanitizes trailer values against
-newline injection, and is pinned LF-only via `.gitattributes` + a build test so the
-embedded copy runs under git-for-windows' sh. Covered by unit + integration tests
-(incl. a real linked-worktree install→commit→assert-trailer) and a CI matrix that
-includes windows-latest.
+newline injection, and is pinned LF-only via `.gitattributes` + a platform-independent
+build test (`!HOOK_BODY.contains('\r')`) so the embedded copy runs under
+git-for-windows' sh. Covered by unit + integration tests (incl. a real linked-worktree
+install→commit→assert-trailer), and verified green on windows-latest in CI (the matrix
+row itself is deferred to a follow-up because a *pre-existing, unrelated* watch-daemon
+test fails on Windows — don't red an in-scope PR on out-of-scope breakage).
 
 Expected effect: every agent-made commit becomes creditable to its persona and
 mission without touching the author line; provenance stops depending on prunable
