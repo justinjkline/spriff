@@ -83,52 +83,38 @@ commit templates and editors). Crucially:
 - **No producer cooperation.** The agent doesn't have to remember anything; the
   hook fires unconditionally. This avoids the silent-skip failure mode the fleet
   bans everywhere else.
-- **Fail-open for humans.** The hook's first line is `[ -n "$SPRIFF_AS" ] || exit 0`.
-  Your own manual commits (no `SPRIFF_AS` in the environment) are untouched.
-- **Idempotent.** It pipes through `git interpret-trailers`, which dedups, so
-  amends/rebases/cherry-picks don't stack duplicate trailers.
+- **Fail-open for humans.** After running any chained hook, the gate
+  `[ -n "$SPRIFF_AS" ] || exit 0` no-ops for commits made outside a spriff agent —
+  your own manual commits (no `SPRIFF_AS`) are untouched.
+- **Best-effort, never blocking.** The trailer step is `|| exit 0`: a stamping hiccup
+  (e.g. a git too old for these flags) lets the commit proceed *unstamped*. Only a
+  *chained* prior hook can veto a commit — because that is real prior behavior.
+- **Injection-safe.** Trailer values are stripped of CR/LF before stamping, so a stray
+  newline can't smuggle in an extra trailer — including the very `Co-Authored-By:
+  <model>` trailer this feature exists to never emit.
+- **Idempotent.** It pipes through `git interpret-trailers` with
+  `--if-exists addIfDifferent`, so amends/rebases/cherry-picks don't stack duplicates.
 
 ## 4. The hook
 
-Ready-to-use at [`hooks/prepare-commit-msg`](../hooks/prepare-commit-msg) in this
-repo. Inline for review:
-
-```sh
-#!/bin/sh
-# spriff prepare-commit-msg hook — stamp agent-provenance trailers.
-#
-# Fires for every commit made *inside a spriff-spawned agent* (identified by the
-# SPRIFF_AS env var that `spriff serve/supervise` exports). No-ops for everyone
-# else — the operator's own manual commits are never touched.
-#
-# Args (git-supplied): $1 = path to the commit message file
-#                      $2 = commit source (message|template|merge|squash|commit|"")
-set -eu
-
-# 1. Only act inside a spriff agent. This is the human-safe gate.
-[ -n "${SPRIFF_AS:-}" ] || exit 0
-
-# 2. Skip auto-generated messages we don't own the body of.
-case "${2:-}" in
-  merge|squash) exit 0 ;;
-esac
-
-# 3. Stamp the trailers. `interpret-trailers` places them in the canonical
-#    trailer block, and --if-exists addIfDifferent keeps it idempotent across
-#    amends/rebases (identical trailer is not re-added).
-set -- --in-place --if-exists addIfDifferent --if-missing add \
-       --trailer "Spriff-Agent: ${SPRIFF_AS}"
-[ -n "${SPRIFF_COLLAB:-}" ] && set -- "$@" --trailer "Spriff-Mission: ${SPRIFF_COLLAB}"
-git interpret-trailers "$@" "$1"
-```
+The hook is [`hooks/prepare-commit-msg`](../hooks/prepare-commit-msg) — the single
+source of truth, embedded into the binary via `include_str!` and installed verbatim.
+Read it there rather than a copy here; duplicating it would drift (an earlier draft of
+this doc inlined a stale copy that had lost a bug fix — exactly what "one source of
+truth" is meant to prevent). Its shape, top to bottom: run any chained `.local` hook
+(fail-closed) → gate on `SPRIFF_AS` → skip merge/squash → strip CR/LF from the values
+→ stamp `Spriff-Agent`/`Spriff-Mission` via `git interpret-trailers` (best-effort). It
+MUST stay LF-only (`.gitattributes` + a build test enforce this) so the embedded copy
+runs under the POSIX sh git-for-windows uses.
 
 ## 5. Installation — `spriff hooks install`
 
 The hook has to live in whatever repo the commit happens in. The supported path is
-the `spriff hooks` command family, which resolves the repo's **effective** hooks dir
-(honoring a pinned `core.hooksPath` — installing into a naive `.git/hooks` would be a
-silent no-op in repos that pin it, like the mcfiddles platform clones) and **chains**
-any pre-existing hook instead of clobbering it:
+the `spriff hooks` command family, which asks git for the exact dir it fires hooks
+from — worktree-correct (agents often run in linked worktrees, where hooks fire from
+the *common* `.git/hooks`, not the per-worktree gitdir) and honoring a pinned
+`core.hooksPath` (e.g. a husky repo's `.husky/`) — and **chains** any pre-existing
+hook instead of clobbering it:
 
 ```sh
 spriff hooks status                 # is it installed here? where's the effective hooks dir?
@@ -139,8 +125,9 @@ spriff hooks uninstall              # remove; restores any hook it had displaced
 ```
 
 Behavior that makes it safe to run broadly:
-- **hooksPath-aware.** Writes to the dir git actually fires hooks from, resolved via
-  `core.hooksPath` → else `.git/hooks`.
+- **Resolves the real hooks dir.** Asks git (`rev-parse --git-path hooks`) for the
+  exact dir it fires hooks from — correct inside linked worktrees (the common
+  `.git/hooks`, not the per-worktree gitdir) and honoring a pinned `core.hooksPath`.
 - **Never clobbers.** A foreign `prepare-commit-msg` is moved to
   `prepare-commit-msg.local` and the installed hook runs it first (preserving exit
   codes); `uninstall` restores it.
@@ -157,9 +144,9 @@ done
 ```
 
 > **Avoid** a blind global `git config --global core.hooksPath …`: it overrides
-> per-repo hooks everywhere and is *silently ignored* by repos that already pin
-> their own `core.hooksPath` (the platform clones do). `spriff hooks install`
-> handles both correctly; prefer it.
+> per-repo hooks everywhere, and is *silently ignored* by any repo that already pins
+> its own `core.hooksPath`. `spriff hooks install` resolves each repo's real hooks
+> dir instead; prefer it.
 
 ## 6. Verification
 

@@ -245,7 +245,24 @@ spriff rollup --collab payments-refactor
 History is never lost — it moves to the archive; agents only ever read the lean
 live board (and only the delta of that).
 
-## 7. The control-plane files (what's in the directory)
+## 7. Attributing agent commits (provenance hooks)
+
+By convention every commit is authored by the human operator with no AI trailer, so
+git alone can't tell you *which agent* produced a change. `spriff hooks install` adds
+a `prepare-commit-msg` hook that stamps `Spriff-Agent:` / `Spriff-Mission:` trailers
+onto commits made inside a spriff-spawned agent (read from the `SPRIFF_AS` /
+`SPRIFF_COLLAB` env vars `serve`/`supervise` export) — additive metadata that leaves
+the commit author untouched and no-ops for your own manual commits.
+
+```sh
+spriff hooks status      # is it installed in this repo? where's the hooks dir?
+spriff hooks install     # install into the current repo (idempotent; chains any existing hook)
+spriff hooks uninstall   # remove; restores a displaced hook
+```
+
+Full design + rationale: [attribution-trailers.md](./attribution-trailers.md).
+
+## 8. The control-plane files (what's in the directory)
 
 Per collaboration, alongside the board:
 
@@ -263,7 +280,7 @@ Per collaboration, alongside the board:
 | `<name>.<persona>.ack.log` | Audit trail of raised/acked signals. |
 | `<name>.<persona>.watch.log` | Watcher process log. |
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 - **"multiple collaborations registered"** — pass `--collab <name>`, set
   `$SPRIFF_COLLAB`, or drop a `.spriff` marker in the repo.
@@ -296,7 +313,7 @@ Per collaboration, alongside the board:
   to post a status sync. `spriff doctor` shows the current idle time and flags a
   `⚠ STALLED` board. Tune or disable via `[stall] idle_secs`.
 
-## 9. Uninstall
+## 10. Uninstall
 
 ```sh
 rm -f ~/.cargo/bin/spriff            # or wherever install.sh placed it

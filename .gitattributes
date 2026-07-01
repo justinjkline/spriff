@@ -1,0 +1,9 @@
+# Normalize line endings so a contributor's core.autocrlf can't change what ships.
+* text=auto eol=lf
+
+# The provenance hook is embedded verbatim into the binary via include_str! and then
+# written to git's hooks dir. It runs under the POSIX sh git-for-windows bundles,
+# which aborts on a trailing CR — so it MUST stay LF-only regardless of platform.
+# (A build test asserts `!HOOK_BODY.contains('\r')`; this keeps the checkout honest.)
+hooks/prepare-commit-msg text eol=lf
+*.sh text eol=lf

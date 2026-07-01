@@ -3625,12 +3625,14 @@ const HOOK_BODY: &str = include_str!("../hooks/prepare-commit-msg");
 /// and never touch a foreign one. An invariant of HOOK_BODY (asserted by a test).
 const HOOK_MARKER: &str = "spriff-provenance-hook";
 
-/// The dir git actually fires hooks from. A repo that pins `core.hooksPath` looks
-/// there, NOT in `.git/hooks`; installing into the wrong dir is a silent no-op (real
-/// repos pin it — e.g. the mcfiddles platform clones). Pure, so the rule is tested.
+/// Fallback hooks-dir resolution for git < 2.31 (see `resolve_repo_hooks`, which
+/// otherwise asks git directly). `common_dir` is the repo's COMMON git dir
+/// (`--git-common-dir`, worktree-safe). A pinned `core.hooksPath` repoints the dir
+/// entirely (e.g. a husky repo's `.husky/`), so honor it — a relative value resolves
+/// against the working-tree root, matching git. Pure, so the rule stays unit-tested.
 fn effective_hooks_dir(
     repo_root: &std::path::Path,
-    git_dir: &std::path::Path,
+    common_dir: &std::path::Path,
     hooks_path_config: Option<&str>,
 ) -> PathBuf {
     match hooks_path_config {
@@ -3643,7 +3645,7 @@ fn effective_hooks_dir(
                 repo_root.join(expanded)
             }
         }
-        _ => git_dir.join("hooks"),
+        _ => common_dir.join("hooks"),
     }
 }
 
@@ -3781,18 +3783,48 @@ fn git_capture(dir: &std::path::Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Resolve (repo_root, effective_hooks_dir) for a repo arg (default: cwd), doing the
-/// git I/O. Bails if the path is not inside a git repository.
+/// Resolve (repo_root, hooks_dir) for a repo arg (default: cwd), doing the git I/O.
+/// Bails if the path is not inside a git repository.
+///
+/// The hooks dir MUST be the one git actually fires hooks from. Two traps make naive
+/// reconstruction wrong: (a) in a LINKED worktree, `--absolute-git-dir` is the
+/// per-worktree dir (`.git/worktrees/<n>`) but hooks fire from the COMMON `.git/hooks`
+/// — writing to the per-worktree dir is a silent no-op, and spriff agents routinely
+/// run in worktrees; (b) `core.hooksPath` can repoint the dir entirely. So we ask git
+/// directly: `rev-parse --path-format=absolute --git-path hooks` returns the common
+/// hooks dir AND honors `core.hooksPath` in one call (git ≥ 2.31). Only if that's
+/// unavailable do we fall back to reconstructing from `--git-common-dir` (which, unlike
+/// `--absolute-git-dir`, is already worktree-correct) + `core.hooksPath`.
 fn resolve_repo_hooks(repo: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
     let start = expand_tilde(&repo.unwrap_or_else(|| PathBuf::from(".")));
-    let git_dir = git_capture(&start, &["rev-parse", "--absolute-git-dir"])
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("{} is not inside a git repository", start.display()))?;
+
+    let hooks_dir = if let Some(h) = git_capture(
+        &start,
+        &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    ) {
+        // Preferred: git computes the exact dir it fires hooks from (worktree-correct,
+        // core.hooksPath-aware). Absolute, so no further resolution needed.
+        PathBuf::from(h)
+    } else {
+        // Fallback for git < 2.31 (no --path-format). --git-common-dir is worktree-safe
+        // (points at the shared .git), unlike --absolute-git-dir.
+        let common = git_capture(&start, &["rev-parse", "--git-common-dir"])
+            .map(|d| {
+                let p = PathBuf::from(&d);
+                if p.is_absolute() {
+                    p
+                } else {
+                    start.join(p)
+                }
+            })
+            .ok_or_else(|| anyhow::anyhow!("{} is not inside a git repository", start.display()))?;
+        let hooks_cfg = git_capture(&start, &["config", "--get", "core.hooksPath"]);
+        effective_hooks_dir(&start, &common, hooks_cfg.as_deref())
+    };
+
     let repo_root = git_capture(&start, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
         .unwrap_or_else(|| start.clone());
-    let hooks_cfg = git_capture(&start, &["config", "--get", "core.hooksPath"]);
-    let hooks_dir = effective_hooks_dir(&repo_root, &git_dir, hooks_cfg.as_deref());
     Ok((repo_root, hooks_dir))
 }
 
@@ -3914,11 +3946,18 @@ mod tests {
             effective_hooks_dir(root, git, Some("  ")),
             PathBuf::from("/repo/.git/hooks")
         );
-        // Absolute config → used as-is (the pinned-hooksPath case that a naive
-        // `.git/hooks` install would silently miss).
+        // Absolute config → used as-is (the pinned-hooksPath case). A leading-slash
+        // path is only `is_absolute()` on unix; on Windows an absolute path needs a
+        // drive prefix, so exercise the branch with a real one per platform.
+        #[cfg(unix)]
         assert_eq!(
             effective_hooks_dir(root, git, Some("/custom/hooks")),
             PathBuf::from("/custom/hooks")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            effective_hooks_dir(root, git, Some(r"C:\custom\hooks")),
+            PathBuf::from(r"C:\custom\hooks")
         );
         // Relative config → resolved against the working-tree root, not .git.
         assert_eq!(
@@ -3933,6 +3972,15 @@ mod tests {
         // and be a shell script. Guards against a future edit breaking recognition.
         assert!(HOOK_BODY.contains(HOOK_MARKER));
         assert!(HOOK_BODY.starts_with("#!"));
+        // MUST stay LF-only: on a Windows checkout with core.autocrlf=true, CRLF would
+        // be embedded via include_str! and installed verbatim, and git-for-windows' sh
+        // aborts on a trailing \r — failing every agent commit. `.gitattributes` pins
+        // eol=lf; this test fails the build the instant CRLF sneaks back in, on ANY
+        // platform (the guard a windows-latest CI job alone would pass over).
+        assert!(
+            !HOOK_BODY.contains('\r'),
+            "hook body must be LF-only (see .gitattributes)"
+        );
     }
 
     #[test]

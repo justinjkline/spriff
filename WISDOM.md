@@ -144,13 +144,16 @@ agent, it can't be silently forgotten — the fleet-wide anti-pattern the hook a
 Evidence: shipped as `spriff hooks install|status|uninstall`
 ([docs/attribution-trailers.md](docs/attribution-trailers.md), hook body in
 [hooks/prepare-commit-msg](hooks/prepare-commit-msg) embedded via `include_str!`).
-The installer resolves the repo's *effective* hooks dir (honoring a pinned
-`core.hooksPath` — a naive `.git/hooks` install is silently ignored where it's
-pinned, e.g. the mcfiddles platform clones) and **chains** any pre-existing hook
-instead of clobbering it. Covered by unit tests (`effective_hooks_dir_honors_core_hookspath`,
-`hook_install_is_idempotent_and_executable`, `hook_install_chains_and_uninstall_restores_foreign_hook`,
-`uninstall_refuses_foreign_hook_and_handles_absent`) + a live end-to-end run
-(default repo AND pinned-hooksPath repo both stamp; human commit stays clean).
+The installer asks git (`rev-parse --git-path hooks`) for the exact dir it fires
+hooks from — **worktree-correct** (agents routinely run in linked worktrees, where
+hooks fire from the *common* `.git/hooks`, not the per-worktree gitdir — a silent
+no-op class an adversarial review caught) and honoring a pinned `core.hooksPath`
+(e.g. husky's `.husky/`) — and **chains** any pre-existing hook instead of clobbering
+it. The hook is best-effort (never blocks a commit), sanitizes trailer values against
+newline injection, and is pinned LF-only via `.gitattributes` + a build test so the
+embedded copy runs under git-for-windows' sh. Covered by unit + integration tests
+(incl. a real linked-worktree install→commit→assert-trailer) and a CI matrix that
+includes windows-latest.
 
 Expected effect: every agent-made commit becomes creditable to its persona and
 mission without touching the author line; provenance stops depending on prunable
