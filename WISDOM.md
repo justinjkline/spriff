@@ -62,6 +62,7 @@ Wrong root-cause diagnoses come from reasoning off commit titles and stale local
 | §8 | Current-Session Wakeups Require Foreground Wait | Foundational Principles |
 | §9 | Sidecar Watchers Need a Native Daemon, Not Ad-Hoc Shell | Foundational Principles |
 | §10 | Live Reviewer Requests Mean the Visible Session by Default | Foundational Principles |
+| §11 | Agent Provenance Survives Only If Stamped | Foundational Principles |
 
 > Add new entries below with the next free `§N` and register them above.
 
@@ -121,3 +122,39 @@ supervisor only when requested.
 Expected effect: operators see the agent they asked doing the work; agents stop
 silently replacing themselves with a hidden child process; sidecar daemons are
 understood as notification durability, not identity ownership.
+
+### §11. Agent Provenance Survives Only If Stamped
+Trigger: an operator admired two shipped PRs (`mcfiddles-platform` #5925 and #5794)
+and could not find which agent produced them. The work *was* done by named spriff
+personas — Pamela (producer), Peter and Punchyman (reviewers) on a mission board —
+but recovering that took hand-matching commit hashes against local session `.jsonl`
+transcripts. Nothing in git recorded it, because the fleet's author convention
+([§7](#7-the-repo-contract-overrides-tool-defaults), mcfiddles `CLAUDE.md`) authors
+every commit as the human with no AI trailer.
+
+Decision/pattern: the author rule stays — but add **additive** provenance trailers
+`Spriff-Agent:` / `Spriff-Mission:`, stamped automatically by a `prepare-commit-msg`
+hook that reads the `SPRIFF_AS` / `SPRIFF_COLLAB` env vars spriff already exports at
+spawn (`run_agent` in `src/main.rs`). This is *not* a `Co-Authored-By: <model>`
+trailer (§7's banned case): authorship stays 100% the operator; a neutral custom key
+just records which of *our* agents did the work. The hook no-ops when `SPRIFF_AS` is
+unset, so human commits are untouched. Because it fires unconditionally inside an
+agent, it can't be silently forgotten — the fleet-wide anti-pattern the hook avoids.
+
+Evidence: shipped as `spriff hooks install|status|uninstall`
+([docs/attribution-trailers.md](docs/attribution-trailers.md), hook body in
+[hooks/prepare-commit-msg](hooks/prepare-commit-msg) embedded via `include_str!`).
+The installer resolves the repo's *effective* hooks dir (honoring a pinned
+`core.hooksPath` — a naive `.git/hooks` install is silently ignored where it's
+pinned, e.g. the mcfiddles platform clones) and **chains** any pre-existing hook
+instead of clobbering it. Covered by unit tests (`effective_hooks_dir_honors_core_hookspath`,
+`hook_install_is_idempotent_and_executable`, `hook_install_chains_and_uninstall_restores_foreign_hook`,
+`uninstall_refuses_foreign_hook_and_handles_absent`) + a live end-to-end run
+(default repo AND pinned-hooksPath repo both stamp; human commit stays clean).
+
+Expected effect: every agent-made commit becomes creditable to its persona and
+mission without touching the author line; provenance stops depending on prunable
+transcripts. The one gate left to the operator is *when/where* to install (per repo
+or a fleet-wide loop) — **not** a blind global `core.hooksPath`, which overrides
+per-repo native hooks (e.g. mcfiddles' `pre-push.sh`) and is itself ignored by repos
+that already pin one. Prefer `spriff hooks install --repo <path>`.

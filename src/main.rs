@@ -378,6 +378,46 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+
+    /// Manage the git provenance hook. It stamps `Spriff-Agent:`/`Spriff-Mission:`
+    /// trailers onto commits made inside a spriff-spawned agent (identified by the
+    /// SPRIFF_AS/SPRIFF_COLLAB env vars spriff already exports), so you can tell
+    /// which persona did the work after the operator-authored commit lands. This is
+    /// additive credit only — the commit Author stays the operator; it is NOT a
+    /// `Co-Authored-By: <model>` trailer (see WISDOM §7). Full design + rationale in
+    /// docs/attribution-trailers.md.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HooksCmd {
+    /// Install the provenance hook into a repo's EFFECTIVE hooks dir (honoring
+    /// core.hooksPath, which several repos pin — a naive `.git/hooks` install would
+    /// be silently ignored there). Any pre-existing prepare-commit-msg hook is
+    /// preserved by chaining, never clobbered. Idempotent; --force refreshes it.
+    Install {
+        /// Repo to install into (default: the current directory's repo).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Refresh an already-installed spriff hook to this binary's version.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Report whether the provenance hook is installed in a repo, and where.
+    Status {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+
+    /// Remove the spriff provenance hook, restoring any hook it had displaced.
+    Uninstall {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 fn restore_default_sigpipe() {
@@ -697,6 +737,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Hooks { action } => cmd_hooks(action),
     }
 }
 
@@ -3564,6 +3605,285 @@ fn cmd_doctor(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Provenance hooks (`spriff hooks …`)
+//
+// Stamp `Spriff-Agent:`/`Spriff-Mission:` git trailers onto commits made inside a
+// spriff-spawned agent, so the persona/mission behind a commit survives the
+// operator-authored commit convention (WISDOM §7 bans AI author trailers, so git
+// otherwise records nothing about *which* agent did the work). The hook script is
+// the single source of truth in `hooks/prepare-commit-msg`, embedded here so the
+// installed binary always writes the version it was built with (same include_str!
+// discipline as SKILL). Design + rationale: docs/attribution-trailers.md.
+// ---------------------------------------------------------------------------
+
+/// The provenance hook body — one source of truth, shared with the standalone
+/// artifact and shell-tested independently of this binary.
+const HOOK_BODY: &str = include_str!("../hooks/prepare-commit-msg");
+
+/// Marker the hook carries so `status`/`uninstall` recognize a spriff-managed hook
+/// and never touch a foreign one. An invariant of HOOK_BODY (asserted by a test).
+const HOOK_MARKER: &str = "spriff-provenance-hook";
+
+/// The dir git actually fires hooks from. A repo that pins `core.hooksPath` looks
+/// there, NOT in `.git/hooks`; installing into the wrong dir is a silent no-op (real
+/// repos pin it — e.g. the mcfiddles platform clones). Pure, so the rule is tested.
+fn effective_hooks_dir(
+    repo_root: &std::path::Path,
+    git_dir: &std::path::Path,
+    hooks_path_config: Option<&str>,
+) -> PathBuf {
+    match hooks_path_config {
+        Some(hp) if !hp.trim().is_empty() => {
+            let expanded = expand_tilde(std::path::Path::new(hp.trim()));
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                // git resolves a relative core.hooksPath against the working-tree root.
+                repo_root.join(expanded)
+            }
+        }
+        _ => git_dir.join("hooks"),
+    }
+}
+
+/// What `install_hook_into` did — returned (not printed) so it stays assertable.
+#[derive(Debug, PartialEq)]
+enum InstallOutcome {
+    Installed,
+    Refreshed,
+    AlreadyPresent,
+    DisplacedThenInstalled,
+}
+
+/// Install/refresh the hook in an already-resolved hooks dir. Pure filesystem (no
+/// git) so it is hermetically testable. Never clobbers a foreign hook: it is moved
+/// aside to `prepare-commit-msg.local`, which the installed hook chains first.
+fn install_hook_into(hooks_dir: &std::path::Path, force: bool) -> Result<InstallOutcome> {
+    std::fs::create_dir_all(hooks_dir)
+        .with_context(|| format!("creating hooks dir {}", hooks_dir.display()))?;
+    let target = hooks_dir.join("prepare-commit-msg");
+    let displaced = hooks_dir.join("prepare-commit-msg.local");
+
+    let mut outcome = InstallOutcome::Installed;
+    if target.exists() {
+        let existing = std::fs::read_to_string(&target).unwrap_or_default();
+        if existing.contains(HOOK_MARKER) {
+            if !force {
+                return Ok(InstallOutcome::AlreadyPresent);
+            }
+            outcome = InstallOutcome::Refreshed;
+        } else {
+            // Foreign hook — preserve by chaining rather than overwrite.
+            if displaced.exists() {
+                anyhow::bail!(
+                    "both {} and a displaced {} exist — refusing to overwrite two hooks; \
+                     resolve manually",
+                    target.display(),
+                    displaced.display()
+                );
+            }
+            std::fs::rename(&target, &displaced)
+                .with_context(|| format!("preserving existing hook as {}", displaced.display()))?;
+            outcome = InstallOutcome::DisplacedThenInstalled;
+        }
+    }
+
+    std::fs::write(&target, HOOK_BODY).with_context(|| format!("writing {}", target.display()))?;
+    make_executable(&target)?;
+    Ok(outcome)
+}
+
+/// What `uninstall_hook_from` did.
+#[derive(Debug, PartialEq)]
+enum UninstallOutcome {
+    Removed,
+    RestoredChained,
+    NothingInstalled,
+}
+
+/// Remove the spriff hook from a resolved hooks dir, restoring any hook it displaced.
+/// Refuses to delete a foreign (non-spriff) hook. Pure filesystem.
+fn uninstall_hook_from(hooks_dir: &std::path::Path) -> Result<UninstallOutcome> {
+    let target = hooks_dir.join("prepare-commit-msg");
+    let displaced = hooks_dir.join("prepare-commit-msg.local");
+    if !target.exists() {
+        return Ok(UninstallOutcome::NothingInstalled);
+    }
+    let existing = std::fs::read_to_string(&target).unwrap_or_default();
+    if !existing.contains(HOOK_MARKER) {
+        anyhow::bail!(
+            "{} is not a spriff-managed hook — leaving it untouched",
+            target.display()
+        );
+    }
+    std::fs::remove_file(&target).with_context(|| format!("removing {}", target.display()))?;
+    if displaced.exists() {
+        std::fs::rename(&displaced, &target)
+            .with_context(|| format!("restoring displaced hook {}", target.display()))?;
+        Ok(UninstallOutcome::RestoredChained)
+    } else {
+        Ok(UninstallOutcome::Removed)
+    }
+}
+
+/// Installed state of the hook in a resolved hooks dir (for `status`).
+#[derive(Debug, PartialEq)]
+enum HookState {
+    Installed { chained: bool },
+    ForeignPresent,
+    Absent,
+}
+
+fn hook_state_of(hooks_dir: &std::path::Path) -> HookState {
+    let target = hooks_dir.join("prepare-commit-msg");
+    if !target.exists() {
+        return HookState::Absent;
+    }
+    let existing = std::fs::read_to_string(&target).unwrap_or_default();
+    if existing.contains(HOOK_MARKER) {
+        HookState::Installed {
+            chained: hooks_dir.join("prepare-commit-msg.local").exists(),
+        }
+    } else {
+        HookState::ForeignPresent
+    }
+}
+
+#[cfg(unix)]
+fn make_executable(p: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(p)
+        .with_context(|| format!("stat {}", p.display()))?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(p, perms).with_context(|| format!("chmod +x {}", p.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_p: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+/// Run `git -C <dir> <args>` and capture trimmed stdout, or None on any failure
+/// (non-git dir, non-zero exit). Used only for read-only resolution queries.
+fn git_capture(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Resolve (repo_root, effective_hooks_dir) for a repo arg (default: cwd), doing the
+/// git I/O. Bails if the path is not inside a git repository.
+fn resolve_repo_hooks(repo: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
+    let start = expand_tilde(&repo.unwrap_or_else(|| PathBuf::from(".")));
+    let git_dir = git_capture(&start, &["rev-parse", "--absolute-git-dir"])
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("{} is not inside a git repository", start.display()))?;
+    let repo_root = git_capture(&start, &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .unwrap_or_else(|| start.clone());
+    let hooks_cfg = git_capture(&start, &["config", "--get", "core.hooksPath"]);
+    let hooks_dir = effective_hooks_dir(&repo_root, &git_dir, hooks_cfg.as_deref());
+    Ok((repo_root, hooks_dir))
+}
+
+fn cmd_hooks(action: HooksCmd) -> Result<()> {
+    match action {
+        HooksCmd::Install { repo, force } => cmd_hooks_install(repo, force),
+        HooksCmd::Status { repo } => cmd_hooks_status(repo),
+        HooksCmd::Uninstall { repo } => cmd_hooks_uninstall(repo),
+    }
+}
+
+fn cmd_hooks_install(repo: Option<PathBuf>, force: bool) -> Result<()> {
+    let (repo_root, hooks_dir) = resolve_repo_hooks(repo)?;
+    let target = hooks_dir.join("prepare-commit-msg");
+    match install_hook_into(&hooks_dir, force)? {
+        InstallOutcome::AlreadyPresent => {
+            println!("✓ already installed — {}", target.display());
+            println!("  (re-run with --force to refresh it to this binary's version)");
+        }
+        InstallOutcome::Refreshed => {
+            println!("✓ refreshed spriff provenance hook → {}", target.display());
+        }
+        InstallOutcome::DisplacedThenInstalled => {
+            println!(
+                "• preserved your existing hook as {} (it runs first)",
+                hooks_dir.join("prepare-commit-msg.local").display()
+            );
+            println!("✓ installed spriff provenance hook → {}", target.display());
+        }
+        InstallOutcome::Installed => {
+            println!("✓ installed spriff provenance hook → {}", target.display());
+        }
+    }
+    println!("  repo: {}", repo_root.display());
+    println!(
+        "\nCommits made under a spriff agent (SPRIFF_AS set by `spriff serve/supervise`) now\n\
+         carry Spriff-Agent/Spriff-Mission trailers; your own manual commits are untouched.\n\
+         Verify: SPRIFF_AS=You git commit --allow-empty -m t && git log -1 --format='%(trailers)'\n\
+         Remove: spriff hooks uninstall"
+    );
+    Ok(())
+}
+
+fn cmd_hooks_status(repo: Option<PathBuf>) -> Result<()> {
+    let (repo_root, hooks_dir) = resolve_repo_hooks(repo)?;
+    println!("repo:       {}", repo_root.display());
+    println!("hooks dir:  {}", hooks_dir.display());
+    match hook_state_of(&hooks_dir) {
+        HookState::Installed { chained } => {
+            println!("provenance: ✓ installed");
+            if chained {
+                println!("chained:    a displaced hook runs first (prepare-commit-msg.local)");
+            }
+        }
+        HookState::ForeignPresent => {
+            println!(
+                "provenance: ✗ not installed — a non-spriff prepare-commit-msg hook is present"
+            );
+            println!("            `spriff hooks install` will preserve it by chaining.");
+        }
+        HookState::Absent => {
+            println!("provenance: ✗ not installed");
+            println!("            run `spriff hooks install` to enable agent attribution here.");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_hooks_uninstall(repo: Option<PathBuf>) -> Result<()> {
+    let (_repo_root, hooks_dir) = resolve_repo_hooks(repo)?;
+    let target = hooks_dir.join("prepare-commit-msg");
+    match uninstall_hook_from(&hooks_dir)? {
+        UninstallOutcome::Removed => {
+            println!("✓ removed spriff provenance hook from {}", target.display());
+        }
+        UninstallOutcome::RestoredChained => {
+            println!(
+                "✓ removed spriff hook and restored your previous hook at {}",
+                target.display()
+            );
+        }
+        UninstallOutcome::NothingInstalled => {
+            println!(
+                "no prepare-commit-msg hook at {} — nothing to remove",
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3579,6 +3899,131 @@ mod tests {
             mission_path(Path::new("/x/bar.md")),
             PathBuf::from("/x/bar.mission.md")
         );
+    }
+
+    #[test]
+    fn effective_hooks_dir_honors_core_hookspath() {
+        let root = Path::new("/repo");
+        let git = Path::new("/repo/.git");
+        // Unset / blank → default .git/hooks.
+        assert_eq!(
+            effective_hooks_dir(root, git, None),
+            PathBuf::from("/repo/.git/hooks")
+        );
+        assert_eq!(
+            effective_hooks_dir(root, git, Some("  ")),
+            PathBuf::from("/repo/.git/hooks")
+        );
+        // Absolute config → used as-is (the pinned-hooksPath case that a naive
+        // `.git/hooks` install would silently miss).
+        assert_eq!(
+            effective_hooks_dir(root, git, Some("/custom/hooks")),
+            PathBuf::from("/custom/hooks")
+        );
+        // Relative config → resolved against the working-tree root, not .git.
+        assert_eq!(
+            effective_hooks_dir(root, git, Some(".husky")),
+            PathBuf::from("/repo/.husky")
+        );
+    }
+
+    #[test]
+    fn embedded_hook_carries_the_marker() {
+        // The include_str! body MUST contain the marker the lifecycle relies on,
+        // and be a shell script. Guards against a future edit breaking recognition.
+        assert!(HOOK_BODY.contains(HOOK_MARKER));
+        assert!(HOOK_BODY.starts_with("#!"));
+    }
+
+    #[test]
+    fn hook_install_is_idempotent_and_executable() {
+        let hooks = std::env::temp_dir().join(format!("spriff-hooks-idem-{}", std::process::id()));
+        std::fs::create_dir_all(&hooks).unwrap();
+
+        assert_eq!(
+            install_hook_into(&hooks, false).unwrap(),
+            InstallOutcome::Installed
+        );
+        let target = hooks.join("prepare-commit-msg");
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains(HOOK_MARKER));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "hook must be executable");
+        }
+        // Re-install without --force → no-op (not a duplicate).
+        assert_eq!(
+            install_hook_into(&hooks, false).unwrap(),
+            InstallOutcome::AlreadyPresent
+        );
+        // --force → refresh.
+        assert_eq!(
+            install_hook_into(&hooks, true).unwrap(),
+            InstallOutcome::Refreshed
+        );
+        assert_eq!(
+            hook_state_of(&hooks),
+            HookState::Installed { chained: false }
+        );
+
+        std::fs::remove_dir_all(&hooks).ok();
+    }
+
+    #[test]
+    fn hook_install_chains_and_uninstall_restores_foreign_hook() {
+        let hooks = std::env::temp_dir().join(format!("spriff-hooks-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&hooks).unwrap();
+        let target = hooks.join("prepare-commit-msg");
+        let displaced = hooks.join("prepare-commit-msg.local");
+
+        // A pre-existing foreign hook must be preserved, not clobbered.
+        std::fs::write(&target, "#!/bin/sh\n# someone-elses-hook\nexit 0\n").unwrap();
+        assert_eq!(hook_state_of(&hooks), HookState::ForeignPresent);
+        assert_eq!(
+            install_hook_into(&hooks, false).unwrap(),
+            InstallOutcome::DisplacedThenInstalled
+        );
+        assert!(std::fs::read_to_string(&displaced)
+            .unwrap()
+            .contains("someone-elses-hook"));
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains(HOOK_MARKER));
+        assert_eq!(
+            hook_state_of(&hooks),
+            HookState::Installed { chained: true }
+        );
+
+        // Uninstall restores the foreign hook verbatim and clears the sidecar.
+        assert_eq!(
+            uninstall_hook_from(&hooks).unwrap(),
+            UninstallOutcome::RestoredChained
+        );
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("someone-elses-hook"));
+        assert!(!displaced.exists());
+
+        std::fs::remove_dir_all(&hooks).ok();
+    }
+
+    #[test]
+    fn uninstall_refuses_foreign_hook_and_handles_absent() {
+        let hooks =
+            std::env::temp_dir().join(format!("spriff-hooks-foreign-{}", std::process::id()));
+        std::fs::create_dir_all(&hooks).unwrap();
+        // Nothing installed → NothingInstalled, no error.
+        assert_eq!(
+            uninstall_hook_from(&hooks).unwrap(),
+            UninstallOutcome::NothingInstalled
+        );
+        // A foreign hook (no spriff marker) must never be deleted by uninstall.
+        std::fs::write(hooks.join("prepare-commit-msg"), "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(uninstall_hook_from(&hooks).is_err());
+        std::fs::remove_dir_all(&hooks).ok();
     }
 
     #[test]

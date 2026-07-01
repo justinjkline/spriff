@@ -1,0 +1,51 @@
+#!/bin/sh
+# spriff-provenance-hook v1 — managed by `spriff hooks`. See docs/attribution-trailers.md
+#
+# WHAT: appends `Spriff-Agent:` / `Spriff-Mission:` git trailers to a commit made
+#       inside a spriff-spawned agent, so we can tell *which* persona did the work
+#       after the operator-authored commit lands. Additive provenance only — the
+#       Author/Committer stay the human, and this is NOT a `Co-Authored-By: <model>`
+#       trailer (that is banned; see WISDOM §7).
+#
+# WHY a hook: `spriff serve/supervise` already exports SPRIFF_AS (persona) and
+#       SPRIFF_COLLAB (mission) into the agent's environment (src/main.rs run_agent).
+#       Reading them here stamps EVERY commit — including `git commit -m` — with no
+#       cooperation from the agent, so it can never be silently forgotten.
+#
+# HUMAN-SAFE: no-ops entirely when SPRIFF_AS is unset (the operator's own manual
+#       commits), so installing it globally/broadly does not touch human commits.
+#
+# CHAINING: if `spriff hooks install` displaced a pre-existing hook, it saved it as
+#       `<thishook>.local` and this script runs it FIRST, preserving prior behavior.
+#
+# The `spriff-provenance-hook` marker on line 2 is how `spriff hooks status/uninstall`
+# recognizes a spriff-managed hook. Do not remove it.
+#
+# Args (git-supplied): $1 = commit message file path
+#                      $2 = commit source (message|template|merge|squash|commit|"")
+set -eu
+
+# 0. Chain any hook we displaced at install time, preserving its behavior/exit code.
+hookdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+prev="$hookdir/$(basename -- "$0").local"
+if [ -x "$prev" ]; then
+  "$prev" "$@" || exit $?
+fi
+
+# 1. Only act inside a spriff agent. This single gate is what keeps human commits clean.
+[ -n "${SPRIFF_AS:-}" ] || exit 0
+
+# 2. Skip auto-generated messages whose body we do not own.
+case "${2:-}" in
+  merge|squash) exit 0 ;;
+esac
+
+# 3. Stamp the trailers. git-interpret-trailers places them in the canonical trailer
+#    block; --if-exists addIfDifferent makes it idempotent across amend/rebase/
+#    cherry-pick (an identical trailer is not duplicated). Capture the message-file
+#    path ($1) BEFORE `set --` rebuilds the arg list, which would otherwise clobber it.
+msgfile="$1"
+set -- --in-place --if-exists addIfDifferent --if-missing add \
+       --trailer "Spriff-Agent: ${SPRIFF_AS}"
+[ -n "${SPRIFF_COLLAB:-}" ] && set -- "$@" --trailer "Spriff-Mission: ${SPRIFF_COLLAB}"
+git interpret-trailers "$@" "$msgfile"
