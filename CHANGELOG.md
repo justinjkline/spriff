@@ -13,6 +13,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`spriff hooks` — agent-provenance git trailers.** `spriff hooks install`
+  installs a `prepare-commit-msg` hook that stamps `Spriff-Agent:` /
+  `Spriff-Mission:` trailers onto commits made inside a spriff-spawned agent (read
+  from the `SPRIFF_AS`/`SPRIFF_COLLAB` env vars `serve`/`supervise` already export),
+  so you can tell *which persona* did the work after the operator-authored commit
+  lands. Additive credit only — the commit Author stays the operator; this is **not**
+  a `Co-Authored-By: <model>` trailer (WISDOM §7). The installer resolves the repo's
+  *effective* hooks dir (honoring a pinned `core.hooksPath`, which a naive
+  `.git/hooks` install would silently miss), **chains** any pre-existing hook instead
+  of clobbering it, and is idempotent; `spriff hooks status` / `spriff hooks
+  uninstall` complete the lifecycle (uninstall restores a displaced hook). The hook
+  no-ops entirely for the operator's own manual commits. One source of truth:
+  `hooks/prepare-commit-msg`, embedded via `include_str!`. Design:
+  [docs/attribution-trailers.md](docs/attribution-trailers.md); rationale: WISDOM §11.
 - **Ironclad mode on by default** (`[loop] ironclad`, default `true`). `join` now
   leads every agent with a **subscribe-to-your-board** step — `spriff supervise` /
   `spriff serve` — and frames the manual `wait`-loop as the fallback, so agents

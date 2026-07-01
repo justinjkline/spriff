@@ -1,0 +1,69 @@
+#!/bin/sh
+# spriff-provenance-hook v1 — managed by `spriff hooks`. See docs/attribution-trailers.md
+#
+# WHAT: appends `Spriff-Agent:` / `Spriff-Mission:` git trailers to a commit made
+#       inside a spriff-spawned agent, so we can tell *which* persona did the work
+#       after the operator-authored commit lands. Additive provenance only — the
+#       Author/Committer stay the human, and this is NOT a `Co-Authored-By: <model>`
+#       trailer (that is banned; see WISDOM §7).
+#
+# WHY a hook: `spriff serve/supervise` already exports SPRIFF_AS (persona) and
+#       SPRIFF_COLLAB (mission) into the agent's environment (src/main.rs run_agent).
+#       Reading them here stamps EVERY commit — including `git commit -m` — with no
+#       cooperation from the agent, so it can never be silently forgotten.
+#
+# HUMAN-SAFE: no-ops entirely when SPRIFF_AS is unset (the operator's own manual
+#       commits), so installing it broadly does not touch human commits.
+#
+# BEST-EFFORT: stamping never BLOCKS a commit — provenance is additive, so a failure
+#       in the trailer step (e.g. a git too old for these flags) lets the commit
+#       proceed unstamped. Only a displaced, chained hook (below) can veto a commit,
+#       because that is real prior behavior we must honor.
+#
+# CHAINING: if `spriff hooks install` displaced a pre-existing hook, it saved it as
+#       `<thishook>.local` and this script runs it FIRST, preserving prior behavior.
+#
+# The `spriff-provenance-hook` marker on line 2 is how `spriff hooks status/uninstall`
+# recognizes a spriff-managed hook. Do not remove it. This file MUST stay LF-only
+# (enforced by .gitattributes + a build test) so the embedded copy runs under the
+# POSIX sh that git-for-windows uses.
+#
+# Args (git-supplied): $1 = commit message file path
+#                      $2 = commit source (message|template|merge|squash|commit|"")
+set -eu
+
+# 0. Chain any hook we displaced at install time, preserving its behavior/exit code.
+#    This runs even for human commits — a prior hook's contract must be honored, and
+#    it stays fail-closed (its non-zero exit aborts the commit).
+hookdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+prev="$hookdir/$(basename -- "$0").local"
+if [ -x "$prev" ]; then
+  "$prev" "$@" || exit $?
+fi
+
+# 1. Only act inside a spriff agent. This single gate is what keeps human commits clean.
+[ -n "${SPRIFF_AS:-}" ] || exit 0
+
+# 2. Skip auto-generated messages whose body we do not own.
+case "${2:-}" in
+  merge|squash) exit 0 ;;
+esac
+
+# 3. Sanitize the trailer VALUES to a single line. The keys are fixed, but a newline
+#    in SPRIFF_AS/SPRIFF_COLLAB would let git-interpret-trailers read the next line as
+#    ANOTHER trailer — including the `Co-Authored-By: <model>` trailer this feature
+#    exists to never emit. Normal operation can't produce a newline (roster names are
+#    literals, --project is slugified), so this is defense-in-depth.
+agent=$(printf '%s' "${SPRIFF_AS}" | tr -d '\r\n')
+mission=$(printf '%s' "${SPRIFF_COLLAB:-}" | tr -d '\r\n')
+[ -n "$agent" ] || exit 0
+
+# 4. Stamp the trailers, BEST-EFFORT (|| exit 0): a provenance hiccup must never block
+#    the agent's real commit. --if-exists addIfDifferent keeps it idempotent across
+#    amend/rebase/cherry-pick. Capture the message-file path ($1) BEFORE `set --`
+#    rebuilds the arg list, which would otherwise clobber it.
+msgfile="$1"
+set -- --in-place --if-exists addIfDifferent --if-missing add \
+       --trailer "Spriff-Agent: ${agent}"
+[ -n "$mission" ] && set -- "$@" --trailer "Spriff-Mission: ${mission}"
+git interpret-trailers "$@" "$msgfile" || exit 0
