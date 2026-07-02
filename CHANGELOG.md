@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-ops entirely for the operator's own manual commits. One source of truth:
   `hooks/prepare-commit-msg`, embedded via `include_str!`. Design:
   [docs/attribution-trailers.md](docs/attribution-trailers.md); rationale: WISDOM §11.
+- **Contract-first protocol in SKILL.md.** Before the implementer writes any
+  code, it posts a `CONTRACT: <mission slug>` turn (`--status NEEDS-REVIEW`) — a
+  numbered checklist of 10–30 testable assertions (command/behavior + expected
+  result). The reviewer sharpens the checklist (adds failure cases, strikes the
+  untestable) until both agree, and the agreed contract becomes the **grading
+  key** for every subsequent `DONE` claim — graded item by item, never against
+  the implementer's narrative. Renegotiation happens via a revised `CONTRACT:`
+  turn; silent drift is the named failure mode. Doc-only: rides on the existing
+  `NEEDS-REVIEW` status marker and subject line, no board-grammar change.
+- **Scored review rubric for subjective surfaces (SKILL.md "Reviewing").**
+  Reviewers grade subjective work (API ergonomics, CLI output, docs) on four
+  written axes — design · craft · legibility-of-why · functionality — each 0–1
+  with a paragraph naming the gap to 1.0, replacing adjective-only feedback.
 - **Ironclad mode on by default** (`[loop] ironclad`, default `true`). `join` now
   leads every agent with a **subscribe-to-your-board** step — `spriff supervise` /
   `spriff serve` — and frames the manual `wait`-loop as the fallback, so agents

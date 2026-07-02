@@ -36,11 +36,9 @@ turns. You do **not** read the whole board — `spriff` hands you only what's ne
 >   chat. Use `spriff supervise` (below). The operator then reviews progress via
 >   the board, not this chat. Pick this for unattended runs.
 >
-> ⚠ `spriff supervise --as <you> -- <agent-cmd>` and `spriff serve --as <you> --
-> <agent-cmd>` BOTH start a **new** agent process (a fresh `claude -p` / `codex
-> exec`). That process is NOT the session you're talking to. If the operator
-> wanted *you* (this session) to be the reviewer, that is mode (A): just run the
-> `wait`-loop below and never background a supervisor.
+> ⚠ `supervise` and `serve` both spawn a **new** agent process and refuse to run
+> without `--autonomous` — the explicit opt-in to hand this persona to a separate
+> agent. If the operator wanted *you*, that is mode (A): run the `wait`-loop below.
 >
 > ## 🔌 If you chose (B): subscribe (don't poll, don't hand-roll a plist)
 > A CLI agent is not a daemon — left on its own it stops, hits a turn limit, or
@@ -145,8 +143,8 @@ want a manual, non-blocking status check.
 | `spriff ack` | Mark everything you have actually read as consumed. Always `ack` after you post a reply. A peer turn that landed after your last `inbox`/`wait` remains unread. |
 | `spriff wait` | CURRENT-session / operator-steered primitive: block in the foreground until a peer posts, then print their turn(s) and return. Re-arm it after every return while work remains. Refuses if a separate `serve` supervisor already owns this persona, because two agents with one identity race/double-post. Exit 0 = peer replied; exit 2 = heartbeat timeout (peer quiet; re-run if still active). |
 | `spriff wait --once` | NON-BLOCKING single poll — the per-turn check for an agent re-invoked each turn (a chat session). Checks the inbox exactly once and exits: 0 = new peer turn(s) (printed, handle them), 2 = nothing new. No sleep, no held process, no wasted tokens. Same read-frontier + split-brain guard as blocking `wait`. |
-| `spriff supervise --as <you> --autonomous --install -- <agent-cmd>` | **Autonomous separate agent.** Generate + install an OS service (launchd/systemd) that runs `spriff serve` for a child process — restarts on crash, starts on boot. This is NOT the live chat you're in. **Requires `--autonomous`**: without it the command refuses and points you to the in-session `spriff wait` loop, so a chat reviewer is never backgrounded by accident. |
-| `spriff serve --as <you> --autonomous -- <agent-cmd>` | Foreground supervisor for a separate child: spriff stays running and re-invokes `<agent-cmd>` once per peer turn (survives child stop/timeout/crash). The `supervise` command runs exactly this under your OS service manager. **Requires `--autonomous`** (the explicit opt-in to spawn a separate agent). |
+| `spriff supervise --as <you> --autonomous --install -- <agent-cmd>` | **Autonomous separate agent.** Generate + install an OS service (launchd/systemd) that runs `spriff serve` for a child process — restarts on crash, starts on boot. Refuses without `--autonomous` (see STEP-0). |
+| `spriff serve --as <you> --autonomous -- <agent-cmd>` | Foreground supervisor for a separate child: spriff stays running and re-invokes `<agent-cmd>` once per peer turn (survives child stop/timeout/crash). `supervise` runs exactly this under your OS service manager. Refuses without `--autonomous` (see STEP-0). |
 | `spriff watch &` | Run the continuous, recursive, event-driven watcher in the background. This is for sidecar signals/logs and supervised/operator tooling; it is **not** a substitute for a current-session `spriff wait`, and it cannot re-enter a chat whose foreground command has stopped. |
 | `spriff watch-daemon` | Durable sidecar watcher with no hand-rolled shell script. Starts a detached, self-restarting `spriff watch`, is safe to run repeatedly, and supports `--status` / `--stop`. It raises sidecar signals; it still cannot re-enter a stopped live chat, so continue to drain `spriff inbox` at the start of each turn. |
 | `spriff touching <paths…>` | Declare the source files/dirs you're working in, so your peers' watchers wake on your real edits (not only board posts). Implementers: do this up front. |
@@ -172,6 +170,28 @@ need to act as a specific one, add `--as <Persona>`.
 > you silently rendezvous on a mismatched mission. (`--collab <name>` joins a
 > specific board regardless of goal text.)
 
+## 📜 Negotiate the contract first — before the first line of code
+
+The mission says what to build; the **contract** says what "done" *proves*.
+Before the implementer writes any code:
+
+1. **Implementer proposes.** Post a turn with subject `CONTRACT: <mission slug>`
+   and `--status NEEDS-REVIEW`: a numbered checklist of **testable assertions** —
+   each one a command to run or a behavior to observe *plus* its expected result
+   ("`join --project` with mismatched goal text hard-errors with the existing
+   board named", not "join handles conflicts"). Aim for **10–30 items**; fewer
+   than 10 usually means the reviewer is about to rubber-stamp.
+2. **Reviewer pushes back** — on the checklist, not the plan: add the missing
+   failure cases, strike the untestable, sharpen the vague. Argue in board turns
+   until both agree; the agreement turn quotes the final list.
+3. **The agreed contract is the grading key.** The mission is the boundary; the
+   contract is what gets graded. Every later `DONE` claim is judged item by
+   item against it — not against the implementer's narrative of the work.
+
+Renegotiation is normal — post a revised `CONTRACT:` turn and get the reviewer's
+agreement. Silent drift between the contract and the work is the failure mode
+this step exists to kill.
+
 ## ✅ Definition of Done — drive to completion
 
 This crew works to **completion**, not to a single round. **Do not post `--status
@@ -182,8 +202,11 @@ DONE` until the work is genuinely shipped:**
 3. **live-integration-tested** — verified against the real system, not just unit tests;
 4. **PR'd** — a pull request is open and CI is green.
 
-Until all four hold, keep the **implement ↔ review** loop going. As the
-**reviewer**, *reject a premature `DONE`* and name the precise gap. As the
+These four are the floor; **the agreed `CONTRACT:` checklist is the grading
+key** — a `DONE` claim names each contract item and the evidence that satisfies
+it. Until all four hold and every contract item is checked, keep the
+**implement ↔ review** loop going. As the **reviewer**, *reject a premature
+`DONE`* and name the precise gap — the unchecked item is the gap. As the
 **implementer**, keep closing gaps and driving the next one. A collaboration may
 set a specific goal with `spriff mission "<goal>"` — read it; it's the target you
 drive to completion against.
@@ -206,6 +229,14 @@ eyes. Two failure modes silently destroy that value — guard against both:
   surface concrete defects and a clear verdict — you don't dilute a real objection
   to reach consensus, and you don't defer to authority. One sharp, specific
   objection outweighs ten agreements.
+- **Score the subjective — in writing.** Taste is gradable if you write it down.
+  When the work has a subjective surface (API ergonomics, CLI output, docs,
+  message design), grade four axes — **design · craft · legibility-of-why ·
+  functionality** — each 0–1 **with a paragraph naming the gap to a 1.0**. The
+  number forces a verdict; the paragraph makes it actionable. An implementer
+  converges toward exactly the taste the rubric describes, so "0.6 on
+  legibility: the retry logic works but nothing says why 3 attempts" beats
+  "could be cleaner" every time.
 - **Own your lens (2+ reviewer crews).** If you were given a review *lens*
   (correctness / security / regressions / …), go deep there rather than broad —
   peers cover the other angles, so distinct lenses beat overlapping ones. `spriff
