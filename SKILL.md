@@ -172,6 +172,28 @@ need to act as a specific one, add `--as <Persona>`.
 > you silently rendezvous on a mismatched mission. (`--collab <name>` joins a
 > specific board regardless of goal text.)
 
+## 📜 Negotiate the contract first — before the first line of code
+
+The mission says what to build; the **contract** says what "done" *proves*.
+Before the implementer writes any code:
+
+1. **Implementer proposes.** Post a turn with subject `CONTRACT: <mission slug>`
+   and `--status NEEDS-REVIEW`: a numbered checklist of **testable assertions** —
+   each one a command to run or a behavior to observe *plus* its expected result
+   ("`join --project` with mismatched goal text hard-errors with the existing
+   board named", not "join handles conflicts"). Aim for **10–30 items**; fewer
+   than 10 usually means the reviewer is about to rubber-stamp.
+2. **Reviewer pushes back** — on the checklist, not the plan: add the missing
+   failure cases, strike the untestable, sharpen the vague. Argue in board turns
+   until both agree; the agreement turn quotes the final list.
+3. **The agreed contract is the grading key.** The mission is the boundary; the
+   contract is what gets graded. Every later `DONE` claim is judged item by
+   item against it — not against the implementer's narrative of the work.
+
+Renegotiation is normal — post a revised `CONTRACT:` turn and get the reviewer's
+agreement. Silent drift between the contract and the work is the failure mode
+this step exists to kill.
+
 ## ✅ Definition of Done — drive to completion
 
 This crew works to **completion**, not to a single round. **Do not post `--status
@@ -182,8 +204,11 @@ DONE` until the work is genuinely shipped:**
 3. **live-integration-tested** — verified against the real system, not just unit tests;
 4. **PR'd** — a pull request is open and CI is green.
 
-Until all four hold, keep the **implement ↔ review** loop going. As the
-**reviewer**, *reject a premature `DONE`* and name the precise gap. As the
+These four are the floor; **the agreed `CONTRACT:` checklist is the grading
+key** — a `DONE` claim names each contract item and the evidence that satisfies
+it. Until all four hold and every contract item is checked, keep the
+**implement ↔ review** loop going. As the **reviewer**, *reject a premature
+`DONE`* and name the precise gap — the unchecked item is the gap. As the
 **implementer**, keep closing gaps and driving the next one. A collaboration may
 set a specific goal with `spriff mission "<goal>"` — read it; it's the target you
 drive to completion against.
@@ -206,6 +231,14 @@ eyes. Two failure modes silently destroy that value — guard against both:
   surface concrete defects and a clear verdict — you don't dilute a real objection
   to reach consensus, and you don't defer to authority. One sharp, specific
   objection outweighs ten agreements.
+- **Score the subjective — in writing.** Taste is gradable if you write it down.
+  When the work has a subjective surface (API ergonomics, CLI output, docs,
+  message design), grade four axes — **design · craft · legibility-of-why ·
+  functionality** — each 0–1 **with a paragraph naming the gap to a 1.0**. The
+  number forces a verdict; the paragraph makes it actionable. An implementer
+  converges toward exactly the taste the rubric describes, so "0.6 on
+  legibility: the retry logic works but nothing says why 3 attempts" beats
+  "could be cleaner" every time.
 - **Own your lens (2+ reviewer crews).** If you were given a review *lens*
   (correctness / security / regressions / …), go deep there rather than broad —
   peers cover the other angles, so distinct lenses beat overlapping ones. `spriff

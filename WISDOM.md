@@ -63,6 +63,7 @@ Wrong root-cause diagnoses come from reasoning off commit titles and stale local
 | §9 | Sidecar Watchers Need a Native Daemon, Not Ad-Hoc Shell | Foundational Principles |
 | §10 | Live Reviewer Requests Mean the Visible Session by Default | Foundational Principles |
 | §11 | Agent Provenance Survives Only If Stamped | Foundational Principles |
+| §12 | The Contract Is What Gets Graded | Foundational Principles |
 
 > Add new entries below with the next free `§N` and register them above.
 
@@ -163,3 +164,31 @@ transcripts. The one gate left to the operator is *when/where* to install (per r
 or a fleet-wide loop) — **not** a blind global `core.hooksPath`, which overrides
 per-repo native hooks (e.g. mcfiddles' `pre-push.sh`) and is itself ignored by repos
 that already pin one. Prefer `spriff hooks install --repo <path>`.
+
+### §12. The Contract Is What Gets Graded
+Trigger: reviews graded `DONE` claims against the implementer's narrative plus a
+4-item prose Definition of Done — which is exactly the surface rubber-stamping
+grows on. §2's heterogeneity only pays off if the reviewer holds an *independent
+grading key*; without one, two diverse models still converge on the author's
+framing.
+
+Decision/pattern: before the first line of code, the implementer posts a
+`CONTRACT:` turn — 10–30 testable assertions (command/behavior + expected
+result) — and the reviewer sharpens it until both agree. That agreed checklist,
+not the story of the work, is what every `DONE` claim is graded against, item by
+item. Subjective surfaces get a written scored rubric (design · craft ·
+legibility-of-why · functionality, 0–1 + gap paragraph) instead of adjectives.
+Renegotiate loudly via a revised `CONTRACT:` turn; silent drift is the failure
+mode. (SKILL.md "Negotiate the contract first" and "Reviewing".)
+
+Evidence: Karpathy, "LOOPS.md: Field Notes on Agents That Run for Days" (2026),
+principles III and VI — contract negotiation was "the single change that moved
+my own runs from broken demos to working products." Adopted after auditing
+spriff against those notes: our review contract already warned against
+rubber-stamping culturally but gave the reviewer no structural artifact to grade
+with.
+
+Expected effect: rubber-stamp reviews become structurally visible (an unchecked
+contract item names the precise gap), premature `DONE` rejections cite items
+instead of vibes, and review quality stops depending on how skeptical a given
+model feels that day.
