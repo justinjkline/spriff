@@ -36,11 +36,9 @@ turns. You do **not** read the whole board — `spriff` hands you only what's ne
 >   chat. Use `spriff supervise` (below). The operator then reviews progress via
 >   the board, not this chat. Pick this for unattended runs.
 >
-> ⚠ `spriff supervise --as <you> -- <agent-cmd>` and `spriff serve --as <you> --
-> <agent-cmd>` BOTH start a **new** agent process (a fresh `claude -p` / `codex
-> exec`). That process is NOT the session you're talking to. If the operator
-> wanted *you* (this session) to be the reviewer, that is mode (A): just run the
-> `wait`-loop below and never background a supervisor.
+> ⚠ `supervise` and `serve` both spawn a **new** agent process and refuse to run
+> without `--autonomous` — the explicit opt-in to hand this persona to a separate
+> agent. If the operator wanted *you*, that is mode (A): run the `wait`-loop below.
 >
 > ## 🔌 If you chose (B): subscribe (don't poll, don't hand-roll a plist)
 > A CLI agent is not a daemon — left on its own it stops, hits a turn limit, or
@@ -145,8 +143,8 @@ want a manual, non-blocking status check.
 | `spriff ack` | Mark everything you have actually read as consumed. Always `ack` after you post a reply. A peer turn that landed after your last `inbox`/`wait` remains unread. |
 | `spriff wait` | CURRENT-session / operator-steered primitive: block in the foreground until a peer posts, then print their turn(s) and return. Re-arm it after every return while work remains. Refuses if a separate `serve` supervisor already owns this persona, because two agents with one identity race/double-post. Exit 0 = peer replied; exit 2 = heartbeat timeout (peer quiet; re-run if still active). |
 | `spriff wait --once` | NON-BLOCKING single poll — the per-turn check for an agent re-invoked each turn (a chat session). Checks the inbox exactly once and exits: 0 = new peer turn(s) (printed, handle them), 2 = nothing new. No sleep, no held process, no wasted tokens. Same read-frontier + split-brain guard as blocking `wait`. |
-| `spriff supervise --as <you> --autonomous --install -- <agent-cmd>` | **Autonomous separate agent.** Generate + install an OS service (launchd/systemd) that runs `spriff serve` for a child process — restarts on crash, starts on boot. This is NOT the live chat you're in. **Requires `--autonomous`**: without it the command refuses and points you to the in-session `spriff wait` loop, so a chat reviewer is never backgrounded by accident. |
-| `spriff serve --as <you> --autonomous -- <agent-cmd>` | Foreground supervisor for a separate child: spriff stays running and re-invokes `<agent-cmd>` once per peer turn (survives child stop/timeout/crash). The `supervise` command runs exactly this under your OS service manager. **Requires `--autonomous`** (the explicit opt-in to spawn a separate agent). |
+| `spriff supervise --as <you> --autonomous --install -- <agent-cmd>` | **Autonomous separate agent.** Generate + install an OS service (launchd/systemd) that runs `spriff serve` for a child process — restarts on crash, starts on boot. Refuses without `--autonomous` (see STEP-0). |
+| `spriff serve --as <you> --autonomous -- <agent-cmd>` | Foreground supervisor for a separate child: spriff stays running and re-invokes `<agent-cmd>` once per peer turn (survives child stop/timeout/crash). `supervise` runs exactly this under your OS service manager. Refuses without `--autonomous` (see STEP-0). |
 | `spriff watch &` | Run the continuous, recursive, event-driven watcher in the background. This is for sidecar signals/logs and supervised/operator tooling; it is **not** a substitute for a current-session `spriff wait`, and it cannot re-enter a chat whose foreground command has stopped. |
 | `spriff watch-daemon` | Durable sidecar watcher with no hand-rolled shell script. Starts a detached, self-restarting `spriff watch`, is safe to run repeatedly, and supports `--status` / `--stop`. It raises sidecar signals; it still cannot re-enter a stopped live chat, so continue to drain `spriff inbox` at the start of each turn. |
 | `spriff touching <paths…>` | Declare the source files/dirs you're working in, so your peers' watchers wake on your real edits (not only board posts). Implementers: do this up front. |
