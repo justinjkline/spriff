@@ -79,8 +79,8 @@ docs too: a stale contract doc is a latent bug).
 - **Small, Fast, Lean — No Fluff**: Production-grade, but spriff stays minimal. No gold-plating, no speculative abstraction, no enterprise theater. New dependencies need a clear justification — prefer the standard library and what's already in `Cargo.toml`.
 - **Match the Surrounding Code**: Write code that reads like its neighbors — same idiom, naming, and **comment density**. This codebase comments the *why*; keep doing that. A change a reviewer can't trace back to a reason is incomplete.
 - **Context-Efficiency Is a Feature**: Don't add a path that re-reads the whole board when it could read the delta. Cheap, incremental reads are a design constraint, not an optimization to defer.
-- **Sub-Two-Minute Rule**: If a fix takes under two minutes, do it now. Don't file an issue. Stay alert for adjacent small wins while you're in the file.
-- **Bugs Found In Flight**: When you spot an unrelated bug mid-task, fix it immediately (or spawn a subagent to) with a tight briefing — don't let it evaporate.
+- **Sub-Two-Minute Rule**: If an in-scope fix takes under two minutes, do it now. Don't file an issue.
+- **Bugs Found In Flight**: When you spot an unrelated bug mid-task, fix it in its own PR (yourself or via a subagent with a tight briefing) rather than folding it into the current one — don't let it evaporate, and don't red an in-scope PR on out-of-scope breakage (WISDOM §11).
 - **Issue Hygiene — Net-Negative Filing**: Before opening an issue, search existing issues for the same symptom/area and close or squash duplicates, stale, or already-fixed ones in the same pass. When you fix something, sweep open issues for related keywords and close what the fix resolved, linking the PR/commit. Close only what is *genuinely* resolved, with evidence — never to hit a quota.
 - **Public Repo Discipline**: This is open source. Never commit secrets, tokens, local paths, or machine-specific config. Security issues go through private reporting (see [SECURITY.md](./SECURITY.md)), never a public issue or PR. Assume every commit is permanent and world-readable.
 
