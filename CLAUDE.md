@@ -30,7 +30,7 @@ working in its area — don't reconstruct what's already written down.
 
 | Doc | What it is | Read it when |
 |---|---|---|
-| [SKILL.md](./SKILL.md) | **The agent collaboration protocol** — the runtime contract an agent follows to *operate* spriff: subscribe via `supervise`/`serve`, do one turn per peer turn (don't poll), `--as <persona>` on every acting command, post bodies via stdin, status markers, definition-of-done, how to review as a skeptical peer. | You change any command, flag, board interaction, turn/inbox/ack semantics, or supervision behavior — the protocol described here must stay true, and the doc must be updated in the same PR. |
+| [SKILL.md](./SKILL.md) | **The agent collaboration protocol** — the runtime contract an agent follows to *operate* spriff: who acts as the persona (by default the visible session, looping on a foreground `spriff wait`; `supervise`/`serve` only for an explicitly opted-in autonomous child), do one turn per peer turn (don't poll), `--as <persona>` on every acting command, post bodies via stdin, status markers, definition-of-done, how to review as a skeptical peer. | You change any command, flag, board interaction, turn/inbox/ack semantics, or supervision behavior — the protocol described here must stay true, and the doc must be updated in the same PR. |
 
 **Architecture & specs:**
 
@@ -82,8 +82,8 @@ docs too: a stale contract doc is a latent bug).
 ## 1. Pull Before You Build
 `git pull --rebase` before any task — coding *or* diagnosis. Stale local state produces wrong root-cause diagnoses and merge pain. Subagents working in worktrees: pull there too.
 
-## 2. Plan Mode for Non-Trivial Work
-Enter plan mode for anything that is 3+ steps or carries an architectural decision. If the work goes sideways mid-stream, stop and re-plan rather than pushing through a broken approach.
+## 2. Settle the Approach, Re-plan When It Breaks
+For work that carries an architectural decision, settle the approach before building. If the work goes sideways mid-stream, stop and re-plan rather than pushing through a broken approach.
 
 ## 3. Survey Before You Build
 Before any substantial change, survey the codebase for what already exists. Every new line must be congruent with the current design. Grep the domain nouns, find the existing abstraction, read the neighboring modules and tests, and check the three pillars. Don't reinvent a helper that's already there.
